@@ -1,0 +1,28 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+.env/
+.venv/
+
+# Build / distribución
+build/
+dist/
+*.spec
+
+# Archivos temporales
+*.log
+*.tmp
+
+# VS Code
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# PyInstaller
+*.exe
