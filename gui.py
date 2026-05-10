@@ -6,10 +6,6 @@ analizar archivos PSD en busca de:
     - Text layers desincronizados (bounds visual vs transform interno).
     - Smart objects compartidos (instancias del mismo asset embebido).
 
-Y reparar los layers de texto desincronizados via cirugia binaria,
-preservando 100% del archivo original (tamaño, modo color, capas,
-mascaras, smart objects, ICC, fuentes).
-
 Layout: panel de archivos a la izquierda + panel de detalle a la derecha
 (50/50, sin modales).
 
@@ -25,12 +21,11 @@ import multiprocessing
 import os
 import platform
 import tkinter as tk
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor
 from queue import Empty, Queue
 from tkinter import filedialog, ttk
 
 from detector import analyze_psd
-from repairer import get_repair_capability, repair_psd
 from utils import reveal_in_file_manager
 
 APP_TITLE = "Layer Audit PSD"
@@ -61,14 +56,6 @@ ST_QUEUED  = 'queued'
 ST_RUNNING = 'running'
 ST_DONE    = 'done'
 
-# Estados de reparacion por fila
-RP_NONE      = 'none'
-RP_AVAILABLE = 'available'
-RP_QUEUED    = 'queued'
-RP_RUNNING   = 'running'
-RP_DONE      = 'done'
-RP_FAILED    = 'failed'
-
 
 def _default_workers():
     n = (os.cpu_count() or 4) - 1
@@ -89,23 +76,16 @@ def _truncate_path(path, max_len=64):
 
 class FileRow(tk.Frame):
     def __init__(self, parent, filepath,
-                 on_select, on_remove, on_run, on_reveal,
-                 on_repair, on_reveal_fixed):
+                 on_select, on_remove, on_run, on_reveal):
         super().__init__(parent, bg=SURFACE, bd=0, highlightthickness=0)
         self.filepath = filepath
         self.filename = os.path.basename(filepath)
         self.result = None
         self.state = ST_IDLE
-        self.repair_state = RP_NONE
-        self.repair_output = None
-        self.repair_error = None
-        self.repair_report = None
         self._on_select = on_select
         self._on_remove = on_remove
         self._on_run = on_run
         self._on_reveal = on_reveal
-        self._on_repair = on_repair
-        self._on_reveal_fixed = on_reveal_fixed
         self._selected = False
 
         self.indicator = tk.Frame(self, bg=BORDER, width=4)
@@ -126,20 +106,11 @@ class FileRow(tk.Frame):
         actions = tk.Frame(top, bg=SURFACE)
         actions.pack(side='right')
 
-        # Boton Reparar (oculto hasta que hay problemas detectados)
-        self.repair_btn = tk.Label(
-            actions, text="Reparar", bg=SURFACE, fg=WARN, cursor='hand2',
-            font=('Segoe UI', 9, 'bold'), padx=8, pady=2
-        )
-        self.repair_btn.bind('<Button-1>', self._handle_repair)
-        self.repair_btn.bind('<Enter>', self._on_repair_hover_in)
-        self.repair_btn.bind('<Leave>', self._on_repair_hover_out)
-
         self.reveal_btn = tk.Label(
             actions, text="Carpeta", bg=SURFACE, fg=TEXT_MUTED, cursor='hand2',
             font=('Segoe UI', 9), padx=6, pady=2
         )
-        self.reveal_btn.pack(side='left', padx=(0, 6))
+        self.reveal_btn.pack(side='right')
         self.reveal_btn.bind('<Button-1>', self._handle_reveal)
         self.reveal_btn.bind('<Enter>',
                              lambda e: self.reveal_btn.config(fg=PRIMARY))
@@ -150,7 +121,7 @@ class FileRow(tk.Frame):
             actions, text="▶", bg=SURFACE, fg=PRIMARY, cursor='hand2',
             font=('Segoe UI', 10, 'bold'), padx=8, pady=2
         )
-        self.run_btn.pack(side='left')
+        self.run_btn.pack(side='right', padx=(0, 6))
         self.run_btn.bind('<Button-1>', self._handle_run)
         self.run_btn.bind('<Enter>',
                           lambda e: self._on_run_hover(True))
@@ -161,7 +132,7 @@ class FileRow(tk.Frame):
             actions, text="✕", bg=SURFACE, fg=TEXT_MUTED, cursor='hand2',
             font=('Segoe UI', 11), padx=6
         )
-        self.remove_btn.pack(side='left', padx=(2, 0))
+        self.remove_btn.pack(side='right', padx=(2, 0))
         self.remove_btn.bind('<Button-1>', self._handle_remove)
         self.remove_btn.bind('<Enter>', self._on_remove_hover_in)
         self.remove_btn.bind('<Leave>', self._on_remove_hover_out)
@@ -214,32 +185,6 @@ class FileRow(tk.Frame):
         self._on_reveal(self)
         return 'break'
 
-    def _handle_repair(self, _e=None):
-        if self.repair_state in (RP_QUEUED, RP_RUNNING):
-            return 'break'
-        if self.repair_state == RP_DONE:
-            self._on_reveal_fixed(self)
-            return 'break'
-        if self.repair_state in (RP_AVAILABLE, RP_FAILED):
-            self._on_repair(self)
-        return 'break'
-
-    def _on_repair_hover_in(self, _e):
-        if self.repair_state == RP_AVAILABLE:
-            self.repair_btn.config(fg='#b45309')
-        elif self.repair_state == RP_DONE:
-            self.repair_btn.config(fg='#15803d')
-        elif self.repair_state == RP_FAILED:
-            self.repair_btn.config(fg='#991b1b')
-
-    def _on_repair_hover_out(self, _e):
-        if self.repair_state == RP_AVAILABLE:
-            self.repair_btn.config(fg=WARN)
-        elif self.repair_state == RP_DONE:
-            self.repair_btn.config(fg=OK)
-        elif self.repair_state == RP_FAILED:
-            self.repair_btn.config(fg=ERR)
-
     def _on_run_hover(self, entering):
         if self.state in (ST_RUNNING, ST_QUEUED):
             return
@@ -275,7 +220,6 @@ class FileRow(tk.Frame):
             self.status_lbl.config(text="Pendiente", fg=TEXT_MUTED)
             self.run_btn.config(text="▶", fg=PRIMARY, cursor='hand2')
             self.remove_btn.config(fg=TEXT_MUTED, cursor='hand2')
-            self.set_repair_state(RP_NONE)
 
         elif state == ST_QUEUED:
             self.bar.config(mode='determinate', value=0)
@@ -303,7 +247,6 @@ class FileRow(tk.Frame):
         if result is None or result.get('error'):
             self.indicator.config(bg=ERR)
             self.status_lbl.config(text="Error abriendo PSD", fg=ERR)
-            self.set_repair_state(RP_NONE)
             return
 
         text_problems = len(result.get('problems', []))
@@ -322,7 +265,6 @@ class FileRow(tk.Frame):
                     text=f"OK ({total_layers} text, {total_so} SO)",
                     fg=OK
                 )
-            self.set_repair_state(RP_NONE)
             return
 
         # Hay al menos un problema
@@ -338,47 +280,6 @@ class FileRow(tk.Frame):
             )
         self.indicator.config(bg=ERR)
         self.status_lbl.config(text=" + ".join(parts), fg=ERR)
-
-        # El boton Reparar solo se ofrece si hay text layers desincronizados
-        # (smart objects compartidos requieren fix manual por ahora).
-        if text_problems > 0:
-            if self.repair_state != RP_DONE:
-                self.set_repair_state(RP_AVAILABLE)
-        else:
-            self.set_repair_state(RP_NONE)
-
-    def set_repair_state(self, state, output=None, error=None, report=None):
-        self.repair_state = state
-        if state == RP_DONE:
-            self.repair_output = output
-            self.repair_report = report
-            self.repair_error = None
-        elif state == RP_FAILED:
-            self.repair_error = error
-            self.repair_report = report
-        elif state == RP_NONE:
-            self.repair_output = None
-            self.repair_error = None
-            self.repair_report = None
-
-        if state == RP_NONE:
-            self.repair_btn.pack_forget()
-            return
-
-        if state == RP_AVAILABLE:
-            self.repair_btn.config(text="Reparar", fg=WARN, cursor='hand2')
-        elif state == RP_QUEUED:
-            self.repair_btn.config(text="En cola...", fg=PRIMARY_DIM, cursor='')
-        elif state == RP_RUNNING:
-            self.repair_btn.config(text="Reparando...", fg=PRIMARY, cursor='')
-        elif state == RP_DONE:
-            self.repair_btn.config(text="✓ Carpeta", fg=OK, cursor='hand2')
-        elif state == RP_FAILED:
-            self.repair_btn.config(text="✗ Reintentar", fg=ERR, cursor='hand2')
-
-        if not self.repair_btn.winfo_ismapped():
-            self.repair_btn.pack(side='left', before=self.reveal_btn,
-                                 padx=(0, 6))
 
     def set_selected(self, selected):
         self._selected = selected
@@ -413,17 +314,10 @@ class FileRow(tk.Frame):
 # ===========================================================================
 
 class DetailsPanel(tk.Frame):
-    def __init__(self, parent, on_reveal=None,
-                 on_repair=None, on_reveal_fixed=None,
-                 repair_capability=None):
+    def __init__(self, parent, on_reveal=None):
         super().__init__(parent, bg=SURFACE, bd=0, highlightthickness=1,
                          highlightbackground=BORDER, highlightcolor=BORDER)
         self._on_reveal = on_reveal
-        self._on_repair = on_repair
-        self._on_reveal_fixed = on_reveal_fixed
-        self._repair_capability = repair_capability or {
-            'available': False, 'method': None, 'reason': ''
-        }
         self.current_row = None
 
         self.header = tk.Frame(self, bg=SURFACE)
@@ -458,23 +352,6 @@ class DetailsPanel(tk.Frame):
         self.badge = tk.Label(
             self.badge_holder, text="", bg=SURFACE, fg=TEXT_MUTED,
             font=('Segoe UI', 9, 'bold'), padx=10, pady=4
-        )
-
-        # Barra de accion para reparar
-        self.action_bar = tk.Frame(self, bg=SURFACE)
-        self.repair_action_btn = ttk.Button(
-            self.action_bar, text="Reparar PSD",
-            command=self._handle_repair_click,
-            style='Primary.TButton'
-        )
-        self.repair_open_btn = ttk.Button(
-            self.action_bar, text="Abrir carpeta",
-            command=self._handle_open_click
-        )
-        self.repair_status_lbl = tk.Label(
-            self.action_bar, text="", bg=SURFACE, fg=TEXT_MUTED,
-            font=('Segoe UI', 9), anchor='w', justify='left',
-            wraplength=460
         )
 
         tk.Frame(self, bg=BORDER, height=1).pack(fill='x')
@@ -532,84 +409,8 @@ class DetailsPanel(tk.Frame):
         if self.current_row and self._on_reveal:
             self._on_reveal(self.current_row)
 
-    def _handle_repair_click(self):
-        if self.current_row and self._on_repair:
-            self._on_repair(self.current_row)
-
-    def _handle_open_click(self):
-        if self.current_row and self._on_reveal_fixed:
-            self._on_reveal_fixed(self.current_row)
-
     def _update_action_bar(self, row):
-        self.repair_action_btn.pack_forget()
-        self.repair_open_btn.pack_forget()
-        self.repair_status_lbl.pack_forget()
-        self.action_bar.pack_forget()
-
-        if row is None or row.result is None:
-            return
-        if row.result.get('error'):
-            return
-        if not row.result.get('problems'):
-            return
-
-        self.action_bar.pack(fill='x', padx=20, pady=(0, 12))
-
-        if not self._repair_capability.get('available'):
-            self.repair_status_lbl.config(
-                text=f"Reparacion no disponible: "
-                     f"{self._repair_capability.get('reason', '')}",
-                fg=TEXT_MUTED
-            )
-            self.repair_status_lbl.pack(side='left', fill='x', expand=True)
-            return
-
-        if row.repair_state in (RP_AVAILABLE, RP_NONE):
-            self.repair_action_btn.config(text="Reparar PSD", state='normal')
-            self.repair_action_btn.pack(side='left')
-            self.repair_status_lbl.config(
-                text="Pulsar para elegir donde guardar la copia reparada. "
-                     "Solo modifica tx/ty del transform; conserva escala, "
-                     "rotacion, capas, mascaras, smart objects e ICC.",
-                fg=TEXT_MUTED
-            )
-            self.repair_status_lbl.pack(side='left', padx=(12, 0))
-        elif row.repair_state == RP_QUEUED:
-            self.repair_action_btn.config(text="En cola...", state='disabled')
-            self.repair_action_btn.pack(side='left')
-            self.repair_status_lbl.config(
-                text="Esperando a otra reparacion en curso...",
-                fg=PRIMARY_DIM
-            )
-            self.repair_status_lbl.pack(side='left', padx=(12, 0))
-        elif row.repair_state == RP_RUNNING:
-            self.repair_action_btn.config(text="Reparando...", state='disabled')
-            self.repair_action_btn.pack(side='left')
-            self.repair_status_lbl.config(
-                text="Reescribiendo los transforms en el binario...",
-                fg=PRIMARY
-            )
-            self.repair_status_lbl.pack(side='left', padx=(12, 0))
-        elif row.repair_state == RP_DONE:
-            self.repair_open_btn.pack(side='left')
-            self.repair_action_btn.config(text="Reparar de nuevo",
-                                          state='normal')
-            self.repair_action_btn.pack(side='left', padx=(8, 0))
-            rpt = row.repair_report or {}
-            fixed = rpt.get('fixed', '?')
-            text = f"Listo: {os.path.basename(row.repair_output)}"
-            if isinstance(fixed, int):
-                text += f"   ({fixed} layer(s) corregido(s))"
-            self.repair_status_lbl.config(text=text, fg=OK)
-            self.repair_status_lbl.pack(side='left', padx=(12, 0))
-        elif row.repair_state == RP_FAILED:
-            self.repair_action_btn.config(text="Reintentar", state='normal')
-            self.repair_action_btn.pack(side='left')
-            self.repair_status_lbl.config(
-                text=f"Error: {row.repair_error or 'reparacion fallida'}",
-                fg=ERR
-            )
-            self.repair_status_lbl.pack(side='left', padx=(12, 0))
+        pass
 
     def _show_reveal_btn(self, show):
         if show:
@@ -638,7 +439,7 @@ class DetailsPanel(tk.Frame):
         self.text.insert('end',
             "    • Cuales text layers estan desincronizados.\n"
             "    • La diferencia exacta entre bounds visuales y transform interno.\n"
-            "    • Como corregirlos antes de procesar el PSD con la API.\n",
+            "    • Smart objects compartidos que requieren accion manual.\n",
             'muted')
         self.text.config(state='disabled')
 
@@ -758,10 +559,9 @@ class DetailsPanel(tk.Frame):
 
             self.text.insert('end', "\n", 'muted')
             self.text.insert('end',
-                "Solucion: pulsa 'Reparar PSD' arriba para elegir donde "
-                "guardar la copia reparada. Solo modifica los 16 bytes "
-                "tx/ty del transform; conserva escala, rotacion, capas, "
-                "mascaras, smart objects, ICC y fuentes.",
+                "Solucion manual: en Photoshop, seleccionar el layer y "
+                "moverlo ligeramente o editar el texto para resincronizar "
+                "el transform interno con la posicion visual.\n",
                 'hint_box')
             self.text.insert('end', "\n", 'muted')
 
@@ -872,12 +672,6 @@ class App(tk.Tk):
         self.workers = _default_workers()
         self.work_queue = []
         self.active_count = 0
-
-        # Reparacion: ejecutor serializado (uno a la vez)
-        self.repair_capability = get_repair_capability()
-        self.repair_executor = None
-        self.repair_queue = []
-        self.repair_active = False
 
         # Por defecto ignorar layers dentro de grupos regulares (no artboards).
         # Los grupos suelen contener assets compartidos entre plataformas
@@ -1004,12 +798,6 @@ class App(tk.Tk):
                                       style='Primary.TButton')
         self.analyze_btn.pack(side='right')
 
-        self.repair_all_btn = ttk.Button(toolbar, text="Reparar Todo",
-                                         command=self.repair_all)
-        self.repair_all_btn.pack(side='right', padx=(0, 6))
-        # Por defecto deshabilitado: se activa cuando hay candidatos
-        self.repair_all_btn.state(['disabled'])
-
         tk.Frame(left, bg=BORDER, height=1).pack(fill='x')
 
         list_wrap = tk.Frame(left, bg=SURFACE)
@@ -1066,20 +854,14 @@ class App(tk.Tk):
             anchor='w', padx=14, pady=10
         )
         self.summary_lbl.pack(side='left', fill='x', expand=True)
-        repair_status = ("Reparacion disponible"
-                         if self.repair_capability['available']
-                         else "Reparacion no disponible")
         tk.Label(footer,
-                 text=f"v{APP_VERSION}  •  {repair_status}",
+                 text=f"v{APP_VERSION}",
                  bg=SURFACE_ALT, fg=TEXT_MUTED, font=('Segoe UI', 8),
                  padx=14).pack(side='right')
 
         self.details = DetailsPanel(
             body,
             on_reveal=self._reveal_row,
-            on_repair=self._repair_row,
-            on_reveal_fixed=self._reveal_fixed,
-            repair_capability=self.repair_capability,
         )
         self.details.grid(row=0, column=1, sticky='nsew')
 
@@ -1156,9 +938,8 @@ class App(tk.Tk):
         tk.Frame(inner, bg=BORDER, height=1).pack(fill='x', pady=(8, 8))
 
         tk.Label(inner,
-                 text=("Reparar texto: cirugia binaria, modifica solo 16 "
-                       "bytes (tx/ty). No toca color, capas, smart objects, "
-                       "ICC ni fuentes. Salida: <archivo>_fixed.psd."),
+                 text=("La aplicacion solo detecta problemas. La correccion "
+                       "debe hacerse manualmente en Photoshop."),
                  bg=SURFACE, fg=TEXT_MUTED, font=('Segoe UI', 9),
                  wraplength=380, justify='left', anchor='w'
                  ).pack(anchor='w', pady=(0, 6))
@@ -1264,13 +1045,10 @@ class App(tk.Tk):
                       on_select=self._select_row,
                       on_remove=self._remove_row,
                       on_run=self._run_row,
-                      on_reveal=self._reveal_row,
-                      on_repair=self._repair_row,
-                      on_reveal_fixed=self._reveal_fixed)
+                      on_reveal=self._reveal_row)
         row.pack(fill='x', pady=(0, 1))
         sep = tk.Frame(self.list_frame, bg=BORDER, height=1)
         sep.pack(fill='x')
-        row._sep = sep
         self.rows.append(row)
 
     def _remove_row(self, row):
@@ -1279,8 +1057,6 @@ class App(tk.Tk):
         if self.selected_row is row:
             self.selected_row = None
             self.details.show_empty()
-        if hasattr(row, '_sep'):
-            row._sep.destroy()
         row.destroy()
         self.rows.remove(row)
         self._refresh_empty_state()
@@ -1291,8 +1067,6 @@ class App(tk.Tk):
         keep = [r for r in self.rows if r.state in busy]
         remove = [r for r in self.rows if r.state not in busy]
         for r in remove:
-            if hasattr(r, '_sep'):
-                r._sep.destroy()
             r.destroy()
         self.rows = keep
         if self.selected_row not in self.rows:
@@ -1392,118 +1166,8 @@ class App(tk.Tk):
             }
         self.queue.put(('done', row, result))
 
-    # --------------------------------------------------------- reparacion
-
-    def _ensure_repair_executor(self):
-        if self.repair_executor is None:
-            self.repair_executor = ThreadPoolExecutor(max_workers=1)
-        return self.repair_executor
-
-    def _repair_row(self, row):
-        if not self.repair_capability['available']:
-            return
-        if row.repair_state in (RP_QUEUED, RP_RUNNING):
-            return
-        if row.result is None or not row.result.get('problems'):
-            return
-
-        # Pedir al usuario donde guardar la copia reparada
-        default_name = os.path.splitext(row.filename)[0] + '_fixed.psd'
-        default_dir = os.path.dirname(row.filepath) or '.'
-        output = filedialog.asksaveasfilename(
-            title=f"Guardar reparacion de {row.filename}",
-            defaultextension='.psd',
-            initialfile=default_name,
-            initialdir=default_dir,
-            filetypes=[("Photoshop PSD", "*.psd"), ("Todos", "*.*")],
-        )
-        if not output:
-            return  # usuario cancelo
-
-        row._repair_output_target = output
-        row.set_repair_state(RP_QUEUED)
-        if self.selected_row is row:
-            self.details._update_action_bar(row)
-
-        self.repair_queue.append(row)
-        self._dispatch_repair()
-
-    def _dispatch_repair(self):
-        if self.repair_active or not self.repair_queue:
-            return
-        executor = self._ensure_repair_executor()
-
-        while self.repair_queue:
-            row = self.repair_queue.pop(0)
-            if not row.winfo_exists() or row.repair_state != RP_QUEUED:
-                continue
-            self.repair_active = True
-            row.set_repair_state(RP_RUNNING)
-            if self.selected_row is row:
-                self.details._update_action_bar(row)
-
-            target = getattr(row, '_repair_output_target', None)
-            future = executor.submit(repair_psd, row.filepath, target)
-            future.add_done_callback(
-                lambda f, r=row: self._on_repair_done(r, f)
-            )
-            return
-
-    def _on_repair_done(self, row, future):
-        try:
-            result = future.result()
-        except Exception as e:
-            result = {'success': False, 'output_path': None,
-                      'error': f"Excepcion: {e}", 'method': None,
-                      'report': None}
-        self.queue.put(('repair_done', row, result))
-
-    def _reveal_fixed(self, row):
-        if row.repair_state != RP_DONE or not row.repair_output:
-            return
-        reveal_in_file_manager(row.repair_output)
-
-    def _repair_all_candidates(self):
-        """Filas con problemas de texto reparables (no en cola/corriendo)."""
-        return [
-            r for r in self.rows
-            if r.result is not None
-            and not r.result.get('error')
-            and r.result.get('problems')
-            and r.repair_state not in (RP_QUEUED, RP_RUNNING)
-        ]
-
-    def repair_all(self):
-        if not self.repair_capability['available']:
-            return
-        candidates = self._repair_all_candidates()
-        if not candidates:
-            return
-
-        # Pedir UNA carpeta destino para todos los reparados
-        target_dir = filedialog.askdirectory(
-            title=(f"Carpeta destino para reparar "
-                   f"{len(candidates)} archivo(s)"),
-            mustexist=True,
-        )
-        if not target_dir:
-            return
-
-        for row in candidates:
-            base = os.path.splitext(row.filename)[0]
-            row._repair_output_target = os.path.join(
-                target_dir, f"{base}_fixed.psd"
-            )
-            row.set_repair_state(RP_QUEUED)
-            if self.selected_row is row:
-                self.details._update_action_bar(row)
-            self.repair_queue.append(row)
-
-        self._dispatch_repair()
-
     def _poll_queue(self):
         any_done = False
-        any_repair_done = False
         try:
             while True:
                 msg = self.queue.get_nowait()
@@ -1515,32 +1179,11 @@ class App(tk.Tk):
                         row.set_state(ST_DONE, result=result)
                         if self.selected_row is row:
                             self.details.show_result(row)
-                elif msg[0] == 'repair_done':
-                    _, row, result = msg
-                    self.repair_active = False
-                    any_repair_done = True
-                    if row.winfo_exists():
-                        if result['success']:
-                            row.set_repair_state(
-                                RP_DONE,
-                                output=result['output_path'],
-                                report=result.get('report'),
-                            )
-                        else:
-                            row.set_repair_state(
-                                RP_FAILED,
-                                error=result['error'],
-                                report=result.get('report'),
-                            )
-                        if self.selected_row is row:
-                            self.details._update_action_bar(row)
         except Empty:
             pass
 
         if any_done:
             self._dispatch()
-        if any_repair_done:
-            self._dispatch_repair()
 
         self._update_summary()
         self.after(50, self._poll_queue)
@@ -1550,7 +1193,6 @@ class App(tk.Tk):
             self.summary_lbl.config(text="Carga uno o mas PSD para empezar.",
                                     fg=TEXT_MUTED)
             self.analyze_btn.state(['!disabled'])
-            self.repair_all_btn.state(['disabled'])
             return
 
         running = [r for r in self.rows if r.state == ST_RUNNING]
@@ -1564,14 +1206,6 @@ class App(tk.Tk):
             self.analyze_btn.state(['disabled'])
         else:
             self.analyze_btn.state(['!disabled'])
-
-        # Reparar Todo: activo solo si hay candidatos (text problems) y la
-        # capacidad esta disponible.
-        candidates = self._repair_all_candidates() if self.repair_capability['available'] else []
-        if candidates and not self.repair_active:
-            self.repair_all_btn.state(['!disabled'])
-        else:
-            self.repair_all_btn.state(['disabled'])
 
         if running or queued:
             parts = []
@@ -1616,12 +1250,6 @@ class App(tk.Tk):
             except TypeError:
                 self.executor.shutdown(wait=False)
             self.executor = None
-        if self.repair_executor is not None:
-            try:
-                self.repair_executor.shutdown(wait=False, cancel_futures=True)
-            except TypeError:
-                self.repair_executor.shutdown(wait=False)
-            self.repair_executor = None
         self.destroy()
 
 

@@ -71,8 +71,9 @@ def main(psd_path, skip_groups=True):
         print(f"\n  TEXT LAYERS QUE FALLARAN CON LA API:")
         for p in problemas:
             print(f"   -> '{p['name']}'")
-        print(f"\n  SOLUCION TEXTO: usar 'binary_repair.py archivo.psd' o el "
-              f"boton Reparar de la GUI. Solo modifica tx/ty, conserva todo.")
+        print(f"\n  SOLUCION TEXTO: en Photoshop, seleccionar el layer y "
+              f"moverlo ligeramente o editar el texto para resincronizar "
+              f"el transform interno con la posicion visual.")
 
     if shared_so:
         print(f"\n  SMART OBJECTS COMPARTIDOS (apuntan al mismo asset):")
