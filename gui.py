@@ -20,12 +20,16 @@ Ejecutar:
 import multiprocessing
 import os
 import platform
+import tempfile
+import threading
+import time
 import tkinter as tk
 from concurrent.futures import ProcessPoolExecutor
 from queue import Empty, Queue
 from tkinter import filedialog, ttk
 
 from detector import analyze_psd
+from fixer import fix_layers_in_psd
 from utils import reveal_in_file_manager
 
 APP_TITLE = "Layer Audit PSD"
@@ -55,6 +59,7 @@ ST_IDLE    = 'idle'
 ST_QUEUED  = 'queued'
 ST_RUNNING = 'running'
 ST_DONE    = 'done'
+ST_FIXING  = 'fixing'
 
 
 def _default_workers():
@@ -236,11 +241,34 @@ class FileRow(tk.Frame):
             self.run_btn.config(text="…", fg=BORDER, cursor='')
             self.remove_btn.config(fg=BORDER, cursor='')
 
+        elif state == ST_FIXING:
+            self.bar.config(mode='indeterminate', value=0)
+            self.bar.start(35)
+            self.indicator.config(bg=WARN)
+            self.status_lbl.config(text="REPARANDO...", fg=WARN)
+            self.run_btn.config(text="…", fg=BORDER, cursor='')
+            self.remove_btn.config(fg=BORDER, cursor='')
+
+        elif state == ST_FIXING:
+            self.bar.config(mode='indeterminate', value=0)
+            self.bar.start(35)
+            self.indicator.config(bg=WARN)
+            self.status_lbl.config(text="REPARANDO...", fg=WARN)
+            self.run_btn.config(text="…", fg=BORDER, cursor='')
+            self.remove_btn.config(fg=BORDER, cursor='')
+
         elif state == ST_DONE:
             self.result = result
             self.bar.config(mode='determinate', value=100)
             self.run_btn.config(text="↻", fg=PRIMARY, cursor='hand2')
             self.remove_btn.config(fg=TEXT_MUTED, cursor='hand2')
+            
+            # Si el nombre del archivo termina en _fixed, marcarlo como reparado
+            if "_fixed.psd" in self.filepath.lower() or "_fixed.psb" in self.filepath.lower():
+                self.indicator.config(bg=OK)
+                self.status_lbl.config(text="REPARADO", fg=OK)
+                return
+
             self._apply_done_visuals(result)
 
     def _apply_done_visuals(self, result):
@@ -336,6 +364,12 @@ class DetailsPanel(tk.Frame):
             command=self._handle_reveal_click
         )
 
+        self.fix_action_btn = ttk.Button(
+            title_row, text="Corregir en Photoshop",
+            style='Primary.TButton',
+            command=self._handle_fix_click
+        )
+
         self.subtitle_lbl = tk.Label(
             self.header, text="Selecciona un archivo a la izquierda para ver el desglose.",
             bg=SURFACE, fg=TEXT_MUTED, font=('Segoe UI', 9), anchor='w',
@@ -409,8 +443,70 @@ class DetailsPanel(tk.Frame):
         if self.current_row and self._on_reveal:
             self._on_reveal(self.current_row)
 
+    def _handle_fix_click(self):
+        if not self.current_row or not self.current_row.result:
+            return
+        
+        problems = self.current_row.result.get('problems', [])
+        if not problems:
+            return
+            
+        layer_data = []
+        for p in problems:
+            bl, bt = p['bounds'] 
+            layer_data.append({
+                'name': p['name'],
+                'layer_id': p.get('layer_id'),
+                'template_layer_id': p.get('template_layer_id'),
+                'template_layer_name': p.get('template_layer_name'),
+                'width': p['width'],
+                'height': p['height'],
+                'left': bl,
+                'top': bt,
+                'right': p.get('bounds_full', (bl, bt, bl + p['width'], bt + p['height']))[2],
+                'bottom': p.get('bounds_full', (bl, bt, bl + p['width'], bt + p['height']))[3],
+                'style': p.get('style', {}),
+                'orientation': p.get('orientation', 'horizontal'),
+                'matrix': p.get('matrix', [1,0,0,1,0,0])
+            })
+
+        psd_path = self.current_row.filepath
+        row = self.current_row
+        row.set_state(ST_FIXING)
+        row._fix_start_time = time.time() # Para el watchdog
+
+        def _run_fix():
+            # Lanzamiento asíncrono vía Popen ya implementado en fixer.py
+            fix_layers_in_psd(psd_path, layer_data)
+
+        threading.Thread(target=_run_fix, daemon=True).start()
     def _update_action_bar(self, row):
-        pass
+        if row is None:
+            self.reveal_action_btn.pack_forget()
+            self.fix_action_btn.pack_forget()
+            return
+
+        # Boton Mostrar en carpeta siempre
+        self.reveal_action_btn.config(text="Mostrar en carpeta")
+        self.reveal_action_btn.pack(side='right')
+
+        # Boton Corregir solo si hay problemas de texto
+        show_fix = False
+        is_fixed_file = "_fixed.psd" in row.filepath.lower() or "_fixed.psb" in row.filepath.lower()
+        
+        if row.result and not row.result.get('error'):
+            if row.result.get('problems'):
+                show_fix = True
+        
+        if is_fixed_file:
+            # Si ya es un archivo reparado, no mostramos botón de corregir, 
+            # pero el de revelar carpeta sigue ahí.
+            self.fix_action_btn.pack_forget()
+            self.reveal_action_btn.config(text="Ver archivo reparado")
+        elif show_fix:
+            self.fix_action_btn.pack(side='right', padx=(0, 6))
+        else:
+            self.fix_action_btn.pack_forget()
 
     def _show_reveal_btn(self, show):
         if show:
@@ -1167,6 +1263,48 @@ class App(tk.Tk):
         self.queue.put(('done', row, result))
 
     def _poll_queue(self):
+        # 1. Monitorear señal de Photoshop para actualización automática
+        temp_dir = tempfile.gettempdir()
+        done_path = os.path.join(temp_dir, "psd_fix_done.txt")
+        
+        if os.path.exists(done_path):
+            try:
+                os.remove(done_path)
+                # Si Photoshop terminó, buscamos el archivo _fixed y lo agregamos/actualizamos
+                if self.selected_row:
+                    orig = self.selected_row.filepath
+                    fixed = orig.replace(".psd", "_fixed.psd").replace(".PSB", "_fixed.psb").replace(".psb", "_fixed.psb")
+                    
+                    # Forzamos la salida del estado FIXING
+                    if self.selected_row.state == ST_FIXING:
+                        self.selected_row.set_state(ST_DONE, result=self.selected_row.result)
+                    
+                    if os.path.exists(fixed):
+                        # Intentar agregarlo a la lista si no está
+                        exists = False
+                        for r in self.rows:
+                            if r.filepath == fixed:
+                                exists = True
+                                self._run_row(r) # Re-analizar
+                                break
+                        if not exists:
+                            self._add_row(fixed)
+                            self._run_row(self.rows[-1])
+            except:
+                pass
+
+        # 2. Watchdog para evitar que el estado "REPARANDO..." se quede infinito
+        now = time.time()
+        for r in self.rows:
+            if r.state == ST_FIXING:
+                # Si lleva más de 45 segundos reparando, asumimos que PS falló o se cerró
+                start_time = getattr(r, '_fix_start_time', 0)
+                if start_time > 0 and (now - start_time) > 45:
+                    r.set_state(ST_DONE, result=r.result)
+                    if self.selected_row is r:
+                        self.details.show_result(r)
+
+        # 3. Procesar cola de resultados de análisis
         any_done = False
         try:
             while True:
@@ -1186,7 +1324,7 @@ class App(tk.Tk):
             self._dispatch()
 
         self._update_summary()
-        self.after(50, self._poll_queue)
+        self.after(100, self._poll_queue)
 
     def _update_summary(self):
         if not self.rows:

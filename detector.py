@@ -44,6 +44,11 @@ THRESHOLD_PX = 200
 # (ej. transform en (-50, -100) con un canvas que arranca en 0,0).
 OUT_OF_CANVAS_MARGIN = 100
 
+# Margen separado para validar contra el artboard/grupo padre. En piezas
+# multiplaforma con texto centrado o justificado, Photoshop puede guardar el
+# punto de texto un poco fuera del artboard aunque la capa sea sana.
+OUT_OF_PARENT_MARGIN = 250
+
 
 def collect_type_layers(layer, layers=None, skip_groups=False):
     """Recorre recursivamente el arbol y devuelve los TypeLayer.
@@ -88,6 +93,33 @@ def _safe_attr(obj, name, default=None):
         return v
     except Exception:
         return default
+
+
+def _extract_type_style(layer):
+    style = {}
+    try:
+        ed = layer.engine_dict
+        run_array = ed['StyleRun']['RunArray']
+        if not run_array:
+            return style
+        data = run_array[0]['StyleSheet']['StyleSheetData']
+        for src, dst in (
+                ('FontSize', 'font_size'),
+                ('Leading', 'leading'),
+                ('Tracking', 'tracking')):
+            value = data.get(src)
+            if value is not None:
+                try:
+                    value = float(value)
+                except Exception:
+                    pass
+                style[dst] = value
+        faux_bold = data.get('FauxBold')
+        if faux_bold is not None:
+            style['faux_bold'] = bool(faux_bold)
+    except Exception:
+        pass
+    return style
 
 
 def analyze_smart_objects(smart_objects):
@@ -165,6 +197,17 @@ def check_type_layer(layer, threshold_px=THRESHOLD_PX,
     """
     bounds_left = layer.left
     bounds_top = layer.top
+    bounds_right = layer.right
+    bounds_bottom = layer.bottom
+    layer_id = _safe_attr(layer, 'layer_id')
+    parent = _safe_attr(layer, 'parent')
+    parent_id = _safe_attr(parent, 'layer_id')
+    parent_name = _safe_attr(parent, 'name')
+    parent_bounds = None
+    try:
+        parent_bounds = tuple(parent.bbox) if parent is not None else None
+    except Exception:
+        parent_bounds = None
 
     try:
         # transform = (xx, xy, yx, yy, tx, ty)
@@ -172,10 +215,20 @@ def check_type_layer(layer, threshold_px=THRESHOLD_PX,
         delta_x = abs(tx - bounds_left)
         delta_y = abs(ty - bounds_top)
 
-        # Regla 1: threshold fijo
+        # Regla 1: threshold fijo. En capas de texto alineadas al centro o
+        # a la derecha, tx puede alejarse bastante de bounds.left sin estar
+        # corrupto; por eso el delta solo es problema si el transform queda
+        # fuera del contenedor natural de la capa.
         delta_exceeded = delta_x > threshold_px or delta_y > threshold_px
+        transform_out_of_parent = False
+        if parent_bounds is not None:
+            pl, pt, pr, pb = parent_bounds
+            m = OUT_OF_PARENT_MARGIN
+            if (tx < pl - m or tx > pr + m or
+                    ty < pt - m or ty > pb + m):
+                transform_out_of_parent = True
 
-        # Regla 2: coordenadas claramente fuera del canvas
+        # Regla 2: coordenadas claramente fuera del canvas.
         out_of_canvas = False
         if doc_width is not None and doc_height is not None:
             m = OUT_OF_CANVAS_MARGIN
@@ -183,18 +236,79 @@ def check_type_layer(layer, threshold_px=THRESHOLD_PX,
                     tx > doc_width + m or ty > doc_height + m):
                 out_of_canvas = True
 
-        is_problem = delta_exceeded or out_of_canvas
+        # Extraer orientacion y transform para reconstruccion fiel
+        orientation = 'horizontal'
+        try:
+            ed = layer.engine_dict
+            # Intento 1: Editor.TextOrientation
+            if ed and 'Editor' in ed:
+                if ed['Editor'].get('TextOrientation') == 1:
+                    orientation = 'vertical'
+            
+            # Intento 2: Heurística por ratio de dimensiones (si es muy alto y estrecho)
+            # Solo si no estamos seguros.
+            if orientation == 'horizontal' and layer.width > 0:
+                ratio = layer.height / layer.width
+                if ratio > 5.0 and len(layer.text.strip()) > 2:
+                    orientation = 'vertical'
+        except:
+            pass
+
+        is_problem = (delta_exceeded and transform_out_of_parent) or out_of_canvas
         reasons = []
-        if delta_exceeded:
+        if delta_exceeded and transform_out_of_parent:
             reasons.append('delta-exceeded')
+        if transform_out_of_parent:
+            reasons.append('out-of-parent')
         if out_of_canvas:
             reasons.append('out-of-canvas')
 
+        # En texto vertical Photoshop guarda la linea base en ty; puede estar
+        # fuera del canvas en capas sanas. El indicador estable de herencia
+        # corrupta para vertical es el eje X.
+        if orientation == 'vertical':
+            vertical_delta_exceeded = delta_x > threshold_px
+            vertical_out_of_canvas = False
+            vertical_out_of_parent = False
+            if parent_bounds is not None:
+                pl, pt, pr, pb = parent_bounds
+                m = OUT_OF_PARENT_MARGIN
+                vertical_out_of_parent = tx < pl - m or tx > pr + m
+            if doc_width is not None:
+                m = OUT_OF_CANVAS_MARGIN
+                vertical_out_of_canvas = tx < -m or tx > doc_width + m
+            is_problem = (
+                vertical_delta_exceeded and vertical_out_of_parent
+            ) or vertical_out_of_canvas
+            reasons = []
+            if vertical_delta_exceeded and vertical_out_of_parent:
+                reasons.append('delta-x-exceeded')
+            if vertical_out_of_parent:
+                reasons.append('x-out-of-parent')
+            if vertical_out_of_canvas:
+                reasons.append('x-out-of-canvas')
+
+        matrix = (1, 0, 0, 1, tx, ty)
+        try:
+            matrix = list(layer.transform)
+        except:
+            pass
+
         return {
             'name': layer.name,
+            'layer_id': layer_id,
+            'parent_id': parent_id,
+            'parent_name': parent_name,
+            'parent_bounds': parent_bounds,
+            'style': _extract_type_style(layer),
             'status': 'DESINCRONIZADO' if is_problem else 'OK',
             'is_problem': is_problem,
             'bounds': (bounds_left, bounds_top),
+            'bounds_full': (bounds_left, bounds_top, bounds_right, bounds_bottom),
+            'width': layer.width,
+            'height': layer.height,
+            'orientation': orientation,
+            'matrix': matrix,
             'transform': (tx, ty),
             'delta': (delta_x, delta_y),
             'threshold': threshold_px,
@@ -204,9 +318,19 @@ def check_type_layer(layer, threshold_px=THRESHOLD_PX,
     except Exception as e:
         return {
             'name': layer.name,
+            'layer_id': layer_id,
+            'parent_id': parent_id,
+            'parent_name': parent_name,
+            'parent_bounds': parent_bounds,
+            'style': _extract_type_style(layer),
             'status': 'NO PUDO LEER TRANSFORM',
             'is_problem': False,
             'bounds': (bounds_left, bounds_top),
+            'bounds_full': (bounds_left, bounds_top, bounds_right, bounds_bottom),
+            'width': layer.width,
+            'height': layer.height,
+            'orientation': 'horizontal',
+            'matrix': (1, 0, 0, 1, 0, 0),
             'transform': None,
             'delta': None,
             'threshold': None,
@@ -292,6 +416,31 @@ def analyze_psd(psd_path, threshold_px=THRESHOLD_PX,
 
     so_groups = analyze_smart_objects(smart_object_layers)
     shared = [g for g in so_groups if g['is_problem']]
+
+    templates_by_parent = {}
+    fallback_template = None
+    for r in layers_results:
+        if r['is_problem']:
+            continue
+        template = {
+            'layer_id': r.get('layer_id'),
+            'name': r.get('name'),
+        }
+        if template['layer_id'] is None:
+            continue
+        if fallback_template is None:
+            fallback_template = template
+        parent_id = r.get('parent_id')
+        if parent_id is not None and parent_id not in templates_by_parent:
+            templates_by_parent[parent_id] = template
+
+    for r in layers_results:
+        if not r['is_problem']:
+            continue
+        template = templates_by_parent.get(r.get('parent_id')) or fallback_template
+        if template:
+            r['template_layer_id'] = template['layer_id']
+            r['template_layer_name'] = template['name']
 
     if progress_callback:
         progress_callback(100.0, "Listo")
