@@ -363,7 +363,7 @@ function scaleLayerToTargetBounds(layer, entry, log) {
         return;
     }
 
-    for (var i = 0; i < 3; i++) {
+    for (var i = 0; i < 6; i++) {
         var b = layerBounds(layer);
         var currentWidth = b.right - b.left;
         var currentHeight = b.bottom - b.top;
@@ -379,7 +379,7 @@ function scaleLayerToTargetBounds(layer, entry, log) {
 
         try {
             layer.resize(scaleX, scaleY, AnchorPosition.TOPLEFT);
-            log.writeln("    escala visual aplicada: " +
+            log.writeln("    escala visual aplicada (iter " + (i+1) + "): " +
                 Math.round(scaleX * 100) / 100 + "% x " +
                 Math.round(scaleY * 100) / 100 + "%.");
         } catch (e) {
@@ -387,6 +387,67 @@ function scaleLayerToTargetBounds(layer, entry, log) {
             return;
         }
     }
+}
+
+// Para texto horizontal de una linea: primero escala uniforme para hacer
+// match de altura (preserva metricas del glifo), despues escala SOLO
+// horizontal hasta que el ancho coincida (acomoda la HorizontalScale del
+// style original que se pierde al recrear la capa).
+function scaleLayerUniformToHeight(layer, entry, log) {
+    if (entry.bottom === undefined || entry.top === undefined) return;
+    var targetHeight = Number(entry.bottom) - Number(entry.top);
+    if (targetHeight <= 0) return;
+
+    for (var i = 0; i < 6; i++) {
+        var b = layerBounds(layer);
+        var currentHeight = b.bottom - b.top;
+        if (currentHeight <= 0) return;
+        var ratio = targetHeight / currentHeight;
+        if (Math.abs(ratio - 1.0) <= 0.005) break;
+        var scale = 100.0 * ratio;
+        try {
+            layer.resize(scale, scale, AnchorPosition.TOPLEFT);
+            log.writeln("    escala uniforme (iter " + (i+1) + "): " +
+                (Math.round(scale * 100) / 100) + "%, ratio=" +
+                ratio.toFixed(4));
+        } catch (e) {
+            log.writeln("    WARNING escala uniforme fallo: " + e);
+            return;
+        }
+    }
+
+    if (entry.right === undefined || entry.left === undefined) return;
+    var targetWidth = Number(entry.right) - Number(entry.left);
+    if (targetWidth <= 0) return;
+
+    for (var j = 0; j < 6; j++) {
+        var b2 = layerBounds(layer);
+        var currentWidth = b2.right - b2.left;
+        if (currentWidth <= 0) return;
+        var wratio = targetWidth / currentWidth;
+        if (Math.abs(wratio - 1.0) <= 0.005) return;
+        try {
+            layer.resize(100.0 * wratio, 100.0, AnchorPosition.TOPLEFT);
+            log.writeln("    escala horizontal (iter " + (j+1) + "): " +
+                (Math.round(wratio * 10000) / 100) + "%, ratio=" +
+                wratio.toFixed(4));
+        } catch (e) {
+            log.writeln("    WARNING escala horizontal fallo: " + e);
+            return;
+        }
+    }
+}
+
+function moveActiveLayerBy(dx, dy) {
+    var desc = new ActionDescriptor();
+    var ref = new ActionReference();
+    ref.putEnumerated(cTID("Lyr "), cTID("Ordn"), cTID("Trgt"));
+    desc.putReference(cTID("null"), ref);
+    var offset = new ActionDescriptor();
+    offset.putUnitDouble(cTID("Hrzn"), cTID("#Pxl"), dx);
+    offset.putUnitDouble(cTID("Vrtc"), cTID("#Pxl"), dy);
+    desc.putObject(cTID("Ofst"), cTID("Ofst"), offset);
+    executeAction(cTID("move"), desc, DialogModes.NO);
 }
 
 function moveLayerToTarget(layer, targetLeft, targetTop, log) {
@@ -397,16 +458,37 @@ function moveLayerToTarget(layer, targetLeft, targetTop, log) {
         return layerBounds(layer);
     }
 
+    selectLayer(layer);
+    var moved = false;
     try {
         layer.translate(dx, dy);
+        moved = true;
     } catch (e) {
-        log.writeln("    WARNING translate fallo, usando textItem.position: " + e);
+        log.writeln("    WARNING translate DOM fallo: " + e);
+    }
+
+    if (!moved) {
         try {
-            layer.textItem.position = [targetLeft, targetTop];
-        } catch (posErr) {
-            log.writeln("    WARNING textItem.position fallo: " + posErr);
+            moveActiveLayerBy(dx, dy);
+            log.writeln("    move via AM aplicado: dx=" + dx + " dy=" + dy);
+            moved = true;
+        } catch (e2) {
+            log.writeln("    WARNING move AM fallo: " + e2);
         }
     }
+
+    if (!moved) {
+        try {
+            // Ultimo recurso: textItem.position ajusta el clickPoint.
+            // No es exacto en bounds porque el clickPoint suele estar en
+            // el baseline (no en bounds.top), pero al menos arrima.
+            layer.textItem.position = [targetLeft, targetTop];
+            log.writeln("    fallback textItem.position aplicado.");
+        } catch (posErr) {
+            log.writeln("    ERROR textItem.position fallo: " + posErr);
+        }
+    }
+
     return layerBounds(layer);
 }
 
@@ -426,19 +508,35 @@ function createCleanTextLayer(source, entry, log) {
     newLayer.name = originalName + "__rebuild";
     copyTextItemBasics(source.textItem, newLayer.textItem, entry, log);
     tuneLeadingToTargetHeight(newLayer, entry, log);
+
+    // Mover ANTES de escalar: para texto chico que sera muy pequeno post-escala,
+    // translate() falla con "Transformar no disponible". Posicionando primero
+    // (mientras la capa aun esta grande) evitamos ese error; luego el resize
+    // con anchor TOPLEFT preserva la posicion.
+    log.writeln("    posicionamiento previo a escala...");
+    moveLayerToTarget(newLayer, targetLeft, targetTop, log);
+
+    // Reescalar para igualar bounds. Vertical: scale eje-por-eje (forzamos
+    // ancho de columna). Horizontal: uniforme por altura + ajuste horizontal
+    // para compensar HorizontalScale/VerticalScale del style original que
+    // se pierden al recrear.
     if (entry.orientation === "vertical") {
         scaleLayerToTargetBounds(newLayer, entry, log);
+    } else {
+        scaleLayerUniformToHeight(newLayer, entry, log);
     }
-    log.writeln("    copiando presentacion...");
-    copyLayerPresentation(source, newLayer);
 
-    log.writeln("    ajustando bounds...");
+    // Re-ajuste fino post-escala (resize puede causar pequeno drift).
+    log.writeln("    re-ajuste post-escala...");
     var b = moveLayerToTarget(newLayer, targetLeft, targetTop, log);
     var dx = targetLeft - b.left;
     var dy = targetTop - b.top;
     if (Math.abs(dx) > 0.5 || Math.abs(dy) > 0.5) {
         b = moveLayerToTarget(newLayer, targetLeft, targetTop, log);
     }
+
+    log.writeln("    copiando presentacion...");
+    copyLayerPresentation(source, newLayer);
 
     log.writeln("    moviendo junto a la capa original...");
     newLayer.move(source, ElementPlacement.PLACEBEFORE);
