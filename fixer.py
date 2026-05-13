@@ -62,7 +62,12 @@ def fix_layers_in_psd(psd_path, layer_data):
         print(f"Error al escribir JSON: {e}")
         return False
 
-    base_dir = os.path.dirname(os.path.abspath(__file__))
+    import sys
+    if hasattr(sys, '_MEIPASS'):
+        base_dir = sys._MEIPASS
+    else:
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        
     jsx_path = os.path.join(base_dir, "fixer.jsx")
     
     if not os.path.exists(jsx_path):

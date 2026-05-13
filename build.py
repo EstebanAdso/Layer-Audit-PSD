@@ -38,6 +38,9 @@ def main():
     for spec in root.glob("*.spec"):
         spec.unlink()
 
+    sysname = platform.system()
+    sep = ';' if sysname == "Windows" else ':'
+    
     cmd = [
         sys.executable, "-m", "PyInstaller",
         "--noconfirm",
@@ -45,12 +48,12 @@ def main():
         "--onefile",
         "--windowed",            # sin consola en Win/Mac
         "--name", APP_NAME,
+        "--add-data", f"fixer.jsx{sep}.",
         # psd-tools usa imports dinamicos para sus parsers internos
         "--collect-submodules", "psd_tools",
         str(entry),
     ]
 
-    sysname = platform.system()
     print(f"Construyendo para {sysname}...")
     print("  " + " ".join(cmd))
     rc = subprocess.call(cmd, cwd=str(root))

@@ -24,13 +24,14 @@ import tempfile
 import threading
 import time
 import tkinter as tk
+from tkinter import messagebox # Añadido
 from concurrent.futures import ProcessPoolExecutor
 from queue import Empty, Queue
 from tkinter import filedialog, ttk
 
 from detector import analyze_psd
 from fixer import fix_layers_in_psd
-from utils import reveal_in_file_manager
+from utils import reveal_in_file_manager, check_photoshop_installed # Añadido
 
 APP_TITLE = "Layer Audit PSD"
 APP_VERSION = "1.6.0"
@@ -60,6 +61,7 @@ ST_QUEUED  = 'queued'
 ST_RUNNING = 'running'
 ST_DONE    = 'done'
 ST_FIXING  = 'fixing'
+ST_FIXED   = 'fixed'
 
 
 def _default_workers():
@@ -175,13 +177,13 @@ class FileRow(tk.Frame):
         self._on_select(self)
 
     def _handle_run(self, _e=None):
-        if self.state in (ST_RUNNING, ST_QUEUED):
+        if self.state in (ST_RUNNING, ST_QUEUED, ST_FIXING):
             return
         self._on_run(self)
         return 'break'
 
     def _handle_remove(self, _e=None):
-        if self.state in (ST_RUNNING, ST_QUEUED):
+        if self.state in (ST_RUNNING, ST_QUEUED, ST_FIXING):
             return
         self._on_remove(self)
         return 'break'
@@ -249,13 +251,12 @@ class FileRow(tk.Frame):
             self.run_btn.config(text="…", fg=BORDER, cursor='')
             self.remove_btn.config(fg=BORDER, cursor='')
 
-        elif state == ST_FIXING:
-            self.bar.config(mode='indeterminate', value=0)
-            self.bar.start(35)
-            self.indicator.config(bg=WARN)
-            self.status_lbl.config(text="REPARANDO...", fg=WARN)
-            self.run_btn.config(text="…", fg=BORDER, cursor='')
-            self.remove_btn.config(fg=BORDER, cursor='')
+        elif state == ST_FIXED:
+            self.bar.config(mode='determinate', value=100)
+            self.indicator.config(bg=OK)
+            self.status_lbl.config(text="REPARADO", fg=OK)
+            self.run_btn.config(text="↻", fg=PRIMARY, cursor='hand2')
+            self.remove_btn.config(fg=TEXT_MUTED, cursor='hand2')
 
         elif state == ST_DONE:
             self.result = result
@@ -441,12 +442,28 @@ class DetailsPanel(tk.Frame):
 
     def _handle_reveal_click(self):
         if self.current_row and self._on_reveal:
+            if self.current_row.state == ST_FIXED:
+                orig = self.current_row.filepath
+                base, ext = os.path.splitext(orig)
+                fixed = f"{base}_fixed{ext}"
+                if os.path.exists(fixed):
+                    reveal_in_file_manager(fixed)
+                    return
             self._on_reveal(self.current_row)
 
     def _handle_fix_click(self):
         if not self.current_row or not self.current_row.result:
             return
         
+        # Verificar si Photoshop está instalado antes de proceder
+        if not check_photoshop_installed():
+            messagebox.showerror(
+                "Photoshop no detectado",
+                "No se pudo encontrar una instalación válida de Adobe Photoshop en este sistema.\n\n"
+                "La función de reparación automática requiere Photoshop instalado para funcionar."
+            )
+            return
+
         problems = self.current_row.result.get('problems', [])
         if not problems:
             return
@@ -480,6 +497,7 @@ class DetailsPanel(tk.Frame):
             fix_layers_in_psd(psd_path, layer_data)
 
         threading.Thread(target=_run_fix, daemon=True).start()
+
     def _update_action_bar(self, row):
         if row is None:
             self.reveal_action_btn.pack_forget()
@@ -498,7 +516,10 @@ class DetailsPanel(tk.Frame):
             if row.result.get('problems'):
                 show_fix = True
         
-        if is_fixed_file:
+        if row.state == ST_FIXED:
+            self.fix_action_btn.pack_forget()
+            self.reveal_action_btn.config(text="Ver archivo reparado")
+        elif is_fixed_file:
             # Si ya es un archivo reparado, no mostramos botón de corregir, 
             # pero el de revelar carpeta sigue ahí.
             self.fix_action_btn.pack_forget()
@@ -580,7 +601,9 @@ class DetailsPanel(tk.Frame):
             self.show_pending(row)
             return
 
-        if result.get('error'):
+        if row.state == ST_FIXED:
+            self._set_badge("Reparado", OK, OK_BG)
+        elif result.get('error'):
             self._set_badge("Error", ERR, ERR_BG)
         else:
             text_p = len(result.get('problems', []))
@@ -608,6 +631,14 @@ class DetailsPanel(tk.Frame):
         self.text.config(state='disabled')
 
     def _render(self, result):
+        if self.current_row.state == ST_FIXED:
+            self.text.insert('end', "\n  ARCHIVO REPARADO CON EXITO\n", 'h')
+            self.text.insert('end', 
+                "  Se ha generado una copia corregida del archivo original.\n"
+                "  Puedes abrirla pulsando el boton 'Ver archivo reparado'.\n", 
+                'ok')
+            self.text.insert('end', "\n" + "-"*40 + "\n", 'muted')
+
         if result.get('error'):
             self.text.insert('end', "\n  ERROR DE LECTURA\n", 'h')
             self.text.insert('end', f"  {result['error']}\n", 'err')
@@ -1270,26 +1301,13 @@ class App(tk.Tk):
         if os.path.exists(done_path):
             try:
                 os.remove(done_path)
-                # Si Photoshop terminó, buscamos el archivo _fixed y lo agregamos/actualizamos
-                if self.selected_row:
-                    orig = self.selected_row.filepath
-                    fixed = orig.replace(".psd", "_fixed.psd").replace(".PSB", "_fixed.psb").replace(".psb", "_fixed.psb")
-                    
-                    # Forzamos la salida del estado FIXING
-                    if self.selected_row.state == ST_FIXING:
-                        self.selected_row.set_state(ST_DONE, result=self.selected_row.result)
-                    
-                    if os.path.exists(fixed):
-                        # Intentar agregarlo a la lista si no está
-                        exists = False
-                        for r in self.rows:
-                            if r.filepath == fixed:
-                                exists = True
-                                self._run_row(r) # Re-analizar
-                                break
-                        if not exists:
-                            self._add_row(fixed)
-                            self._run_row(self.rows[-1])
+                # Buscar la fila que estaba reparando
+                for r in self.rows:
+                    if r.state == ST_FIXING:
+                        r.set_state(ST_FIXED, result=r.result)
+                        if self.selected_row is r:
+                            self.details.show_result(r)
+                        break
             except:
                 pass
 
@@ -1297,9 +1315,9 @@ class App(tk.Tk):
         now = time.time()
         for r in self.rows:
             if r.state == ST_FIXING:
-                # Si lleva más de 45 segundos reparando, asumimos que PS falló o se cerró
+                # Si lleva más de 60 segundos reparando, asumimos que PS falló o se cerró
                 start_time = getattr(r, '_fix_start_time', 0)
-                if start_time > 0 and (now - start_time) > 45:
+                if start_time > 0 and (now - start_time) > 60:
                     r.set_state(ST_DONE, result=r.result)
                     if self.selected_row is r:
                         self.details.show_result(r)
