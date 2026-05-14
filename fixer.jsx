@@ -216,18 +216,10 @@ function duplicateLayerById(id) {
     return app.activeDocument.activeLayer;
 }
 
-function makeBlankTextLayer(parent, entry, log) {
-    try {
-        if (parent && parent.artLayers) {
-            var domLayer = parent.artLayers.add();
-            domLayer.kind = LayerKind.TEXT;
-            domLayer.textItem.contents = " ";
-            return domLayer;
-        }
-    } catch (e) {
-        log.writeln("    WARNING crear texto DOM fallo: " + e);
-    }
+function makeBlankTextLayer(parent, entry, source, log) {
+    var doc = app.activeDocument;
 
+    // PRIMERA ruta: AM action "Mk TxLr" en doc raiz.
     try {
         var desc = new ActionDescriptor();
         var ref = new ActionReference();
@@ -243,14 +235,46 @@ function makeBlankTextLayer(parent, entry, log) {
 
         desc.putObject(cTID("Usng"), cTID("TxLr"), textDesc);
         executeAction(cTID("Mk  "), desc, DialogModes.NO);
-        return app.activeDocument.activeLayer;
-    } catch (e2) {
-        log.writeln("    WARNING crear texto AM fallo: " + e2);
+        return doc.activeLayer;
+    } catch (e1) {
+        log.writeln("    WARNING crear texto AM fallo: " + e1);
     }
 
+    // Fallback A: duplicar TEMPLATE (capa sana del mismo parent). Hereda
+    // transform LIMPIO y no toca parent.artLayers (evita bug TÍTULOS).
     if (entry.template_layer_id !== undefined && entry.template_layer_id !== null && entry.template_layer_id !== "") {
-        log.writeln("    fallback: duplicando plantilla limpia id=" + entry.template_layer_id);
-        return duplicateLayerById(entry.template_layer_id);
+        try {
+            var tdup = duplicateLayerById(entry.template_layer_id);
+            log.writeln("    fallback: duplicando template id=" + entry.template_layer_id);
+            return tdup;
+        } catch (e2) {
+            log.writeln("    WARNING duplicate template fallo: " + e2);
+        }
+    }
+
+    // Fallback B: doc.artLayers.add() en raiz + asignar kind=TEXT. En algunas
+    // versiones de PS esto falla con "La capa no puede contener texto".
+    try {
+        var domLayer = doc.artLayers.add();
+        domLayer.kind = LayerKind.TEXT;
+        domLayer.textItem.contents = " ";
+        log.writeln("    fallback DOM doc.artLayers.add()");
+        return domLayer;
+    } catch (e3) {
+        log.writeln("    WARNING crear texto DOM (raiz) fallo: " + e3);
+    }
+
+    // Fallback C: parent.artLayers.add() (riesgo de bug TÍTULOS).
+    try {
+        if (parent && parent.artLayers) {
+            var dom2 = parent.artLayers.add();
+            dom2.kind = LayerKind.TEXT;
+            dom2.textItem.contents = " ";
+            log.writeln("    fallback DOM parent.artLayers.add() (RIESGO TÍTULOS)");
+            return dom2;
+        }
+    } catch (e4) {
+        log.writeln("    WARNING crear texto DOM (parent) fallo: " + e4);
     }
 
     throw new Error("No se pudo crear una capa de texto nueva y no hay plantilla limpia.");
@@ -283,7 +307,26 @@ function copyTextItemBasics(sourceItem, targetItem, entry, log) {
     }
     try { targetItem.kind = sourceItem.kind; } catch (e) {}
     try { targetItem.contents = sourceItem.contents; } catch (e) {}
-    try { targetItem.font = sourceItem.font; } catch (e) {}
+    // Fuente: priorizar el nombre PostScript leido desde engine_dict (bytes
+    // crudos del PSD via psd_tools, en el manifest). El DOM textItem.font de
+    // la capa original puede devolver el nombre stored (correcto) pero la
+    // capa renderizar con un sustituto si la fuente no esta instalada — al
+    // copiar via DOM la asignacion tambien se substituye. Logueamos el
+    // resultado real para detectar fuentes faltantes en el sistema.
+    try {
+        var requested = style.font_name || (function(){ try { return sourceItem.font; } catch (e) { return ""; } })();
+        if (requested) {
+            targetItem.font = requested;
+            var applied = "";
+            try { applied = targetItem.font; } catch (e) {}
+            if (applied !== requested) {
+                log.writeln("    AVISO: fuente '" + requested +
+                    "' NO INSTALADA -> Photoshop sustituyo por '" + applied + "'");
+            }
+        }
+    } catch (e) {
+        log.writeln("    WARNING aplicando fuente: " + e);
+    }
     try {
         if (style.font_size !== undefined) targetItem.size = UnitValue(Number(style.font_size) * textScale, "pt");
         else targetItem.size = sourceItem.size;
@@ -492,22 +535,604 @@ function moveLayerToTarget(layer, targetLeft, targetTop, log) {
     return layerBounds(layer);
 }
 
+// Copy minimo para texto rotado: fuerza POINTTEXT, no setea width/height/
+// position (esas las maneja el flujo de rotacion+escala+move posterior).
+//
+// size/leading se copian DIRECTAMENTE del sourceItem (no multiplicamos por
+// matrix scale). Photoshop ya reporta el tamano efectivo en pt que ve el
+// usuario en el panel Character — usar style.font_size * matrix_scale daria
+// un tamano ~3% mayor al original porque la escala efectiva en pantalla no
+// es exactamente la componente xx/yy del transform crudo del TyShO.
+function copyRotatedTextItemBasics(sourceItem, targetItem, entry, metrics, log) {
+    var style = entry.style || {};
+    metrics = metrics || {};
+
+    try { targetItem.kind = TextType.POINTTEXT; } catch (e) {
+        log.writeln("    WARNING forzar POINTTEXT fallo: " + e);
+    }
+    try { targetItem.font = sourceItem.font; } catch (e) {}
+    try { targetItem.contents = sourceItem.contents; } catch (e) {}
+
+    // size efectivo (visual) leido del descriptor del textKey original.
+    // Fallback al sourceItem.size (nominal) si no se pudo leer.
+    var appliedSize = null;
+    try {
+        if (metrics.size !== null && metrics.size !== undefined &&
+                isFinite(metrics.size) && metrics.size > 0) {
+            targetItem.size = UnitValue(Number(metrics.size), "pt");
+            appliedSize = Number(metrics.size);
+        } else {
+            targetItem.size = sourceItem.size;
+            appliedSize = px(sourceItem.size);
+        }
+    } catch (e) {
+        if (style.font_size !== undefined) {
+            try { targetItem.size = UnitValue(Number(style.font_size), "pt"); } catch (e2) {}
+        }
+    }
+
+    var appliedLeading = null;
+    try {
+        var hasExplicitLeading = (metrics.leading !== null && metrics.leading !== undefined &&
+                                  isFinite(metrics.leading) && metrics.leading > 0);
+        var autoLead = (metrics.autoLeading === true);
+        if (hasExplicitLeading && !autoLead) {
+            targetItem.useAutoLeading = false;
+            targetItem.leading = UnitValue(Number(metrics.leading), "pt");
+            appliedLeading = Number(metrics.leading);
+        } else if (autoLead) {
+            targetItem.useAutoLeading = true;
+        } else {
+            // Sin info del descriptor: copiar del DOM.
+            targetItem.useAutoLeading = sourceItem.useAutoLeading;
+            if (!sourceItem.useAutoLeading) {
+                targetItem.leading = sourceItem.leading;
+                appliedLeading = px(sourceItem.leading);
+            }
+        }
+    } catch (e) {
+        if (style.leading !== undefined) {
+            try {
+                targetItem.useAutoLeading = false;
+                targetItem.leading = UnitValue(Number(style.leading), "pt");
+            } catch (e2) {}
+        }
+    }
+
+    try {
+        if (metrics.tracking !== null && metrics.tracking !== undefined) {
+            targetItem.tracking = Number(metrics.tracking);
+        } else {
+            targetItem.tracking = sourceItem.tracking;
+        }
+    } catch (e) {}
+    try { targetItem.color = sourceItem.color; } catch (e) {}
+    try { targetItem.justification = sourceItem.justification; } catch (e) {}
+    try { targetItem.antiAliasMethod = sourceItem.antiAliasMethod; } catch (e) {}
+    try { targetItem.capitalization = sourceItem.capitalization; } catch (e) {}
+    try {
+        if (metrics.horizontalScale !== null && metrics.horizontalScale !== undefined) {
+            targetItem.horizontalScale = Number(metrics.horizontalScale);
+        } else {
+            targetItem.horizontalScale = sourceItem.horizontalScale;
+        }
+    } catch (e) {}
+    try {
+        if (metrics.verticalScale !== null && metrics.verticalScale !== undefined) {
+            targetItem.verticalScale = Number(metrics.verticalScale);
+        } else {
+            targetItem.verticalScale = sourceItem.verticalScale;
+        }
+    } catch (e) {}
+    try {
+        if (metrics.baselineShift !== null && metrics.baselineShift !== undefined) {
+            targetItem.baselineShift = UnitValue(Number(metrics.baselineShift), "pt");
+        } else {
+            targetItem.baselineShift = sourceItem.baselineShift;
+        }
+    } catch (e) {}
+    log.writeln("    propiedades rotadas de textItem copiadas (size=" +
+        (appliedSize !== null ? appliedSize.toFixed(2) : "?") +
+        "pt, leading=" +
+        (appliedLeading !== null ? appliedLeading.toFixed(2) : "auto") + ").");
+}
+
+// Lee size, leading y tracking EFECTIVOS de la primera run de estilo, tal
+// como Photoshop los muestra en el panel Character (post-escala visual).
+// sourceItem.size devuelve el size NOMINAL del style sheet (9.2pt en una
+// capa rotada/escalada con matriz 3.84x), no el efectivo (34.41pt) — por
+// eso vamos a leerlo via descriptor.
+function readEffectiveTextMetrics(source, log) {
+    var result = {
+        size: null, leading: null, autoLeading: null, tracking: null,
+        horizontalScale: null, verticalScale: null, baselineShift: null
+    };
+    try {
+        selectLayer(source);
+        var desc = getTargetLayerDescriptor();
+        if (!desc.hasKey(sTID("textKey"))) return result;
+        var textKey = desc.getObjectValue(sTID("textKey"));
+        if (!textKey.hasKey(sTID("textStyleRange"))) return result;
+        var rangeList = textKey.getList(sTID("textStyleRange"));
+        if (rangeList.count === 0) return result;
+        var range = rangeList.getObjectValue(0);
+        if (!range.hasKey(sTID("textStyle"))) return result;
+        var ts = range.getObjectValue(sTID("textStyle"));
+        // impliedFontSize / impliedLeading son los valores POST-transform que
+        // Photoshop muestra en el panel Character. "size" / "leading" son el
+        // valor NOMINAL del style sheet, pre-transform — preferimos implied.
+        try {
+            if (ts.hasKey(sTID("impliedFontSize"))) {
+                result.size = ts.getUnitDoubleValue(sTID("impliedFontSize"));
+            } else if (ts.hasKey(sTID("size"))) {
+                result.size = ts.getUnitDoubleValue(sTID("size"));
+            }
+        } catch (e) {}
+        try {
+            if (ts.hasKey(sTID("autoLeading"))) {
+                result.autoLeading = ts.getBoolean(sTID("autoLeading"));
+            }
+        } catch (e) {}
+        try {
+            if (ts.hasKey(sTID("impliedLeading"))) {
+                result.leading = ts.getUnitDoubleValue(sTID("impliedLeading"));
+            } else if (ts.hasKey(sTID("leading"))) {
+                result.leading = ts.getUnitDoubleValue(sTID("leading"));
+            }
+        } catch (e) {}
+        try {
+            if (ts.hasKey(sTID("tracking"))) {
+                result.tracking = ts.getInteger(sTID("tracking"));
+            }
+        } catch (e) {}
+        try {
+            if (ts.hasKey(sTID("horizontalScale"))) {
+                result.horizontalScale = ts.getDouble(sTID("horizontalScale"));
+            }
+        } catch (e) {}
+        try {
+            if (ts.hasKey(sTID("verticalScale"))) {
+                result.verticalScale = ts.getDouble(sTID("verticalScale"));
+            }
+        } catch (e) {}
+        try {
+            if (ts.hasKey(sTID("impliedBaselineShift"))) {
+                result.baselineShift = ts.getUnitDoubleValue(sTID("impliedBaselineShift"));
+            } else if (ts.hasKey(sTID("baselineShift"))) {
+                result.baselineShift = ts.getUnitDoubleValue(sTID("baselineShift"));
+            }
+        } catch (e) {}
+    } catch (e) {
+        log.writeln("    WARNING leyendo metrics efectivas: " + e);
+    }
+    log.writeln("    metrics efectivas: size=" +
+        (result.size !== null ? result.size.toFixed(3) : "?") +
+        "pt, leading=" +
+        (result.leading !== null ? result.leading.toFixed(3) : "?") +
+        "pt, hScale=" +
+        (result.horizontalScale !== null ? result.horizontalScale.toFixed(2) + "%" : "?") +
+        ", vScale=" +
+        (result.verticalScale !== null ? result.verticalScale.toFixed(2) + "%" : "?") +
+        ", autoLeading=" + result.autoLeading);
+    return result;
+}
+
+// Lee el angulo de rotacion (en grados) de un text layer leyendo la matriz
+// del descriptor en vivo. La rotacion no aparece en el TyShO transform que
+// lee psd_tools, pero Photoshop si la conserva en textKey/textShape.
+function getLayerRotationDegrees(source, log) {
+    try {
+        selectLayer(source);
+        var desc = getTargetLayerDescriptor();
+        if (!desc.hasKey(sTID("textKey"))) return 0;
+        var textKey = desc.getObjectValue(sTID("textKey"));
+
+        function readAngle(transform, label) {
+            try {
+                var xx = transform.getDouble(sTID("xx"));
+                var xy = transform.getDouble(sTID("xy"));
+                if (Math.abs(xy) < 1e-6 && Math.abs(xx - 1) < 1e-6) {
+                    return null;
+                }
+                var deg = Math.atan2(xy, xx) * 180 / Math.PI;
+                log.writeln("    rotation " + label + ": xx=" + xx +
+                    " xy=" + xy + " -> " + deg.toFixed(2) + " deg");
+                return deg;
+            } catch (e) {
+                return null;
+            }
+        }
+
+        if (textKey.hasKey(sTID("textShape"))) {
+            var shapeList = textKey.getList(sTID("textShape"));
+            if (shapeList.count > 0) {
+                var shape = shapeList.getObjectValue(0);
+                if (shape.hasKey(sTID("transform"))) {
+                    var ang = readAngle(shape.getObjectValue(sTID("transform")),
+                                        "textShape[0]");
+                    if (ang !== null) return ang;
+                }
+            }
+        }
+        if (textKey.hasKey(sTID("transform"))) {
+            var ang2 = readAngle(textKey.getObjectValue(sTID("transform")),
+                                 "textKey");
+            if (ang2 !== null) return ang2;
+        }
+    } catch (e) {
+        log.writeln("    rotation read error: " + e);
+    }
+    return 0;
+}
+
+// Lee el textStyle COMPLETO (descriptor entero) de la primera run de estilo
+// del texto original. Devuelve null si no se pudo leer.
+function readSourceTextStyleDescriptor(source) {
+    try {
+        selectLayer(source);
+        var d = getTargetLayerDescriptor();
+        if (!d.hasKey(sTID("textKey"))) return null;
+        var tk = d.getObjectValue(sTID("textKey"));
+        if (!tk.hasKey(sTID("textStyleRange"))) return null;
+        var rl = tk.getList(sTID("textStyleRange"));
+        if (rl.count === 0) return null;
+        var range = rl.getObjectValue(0);
+        if (!range.hasKey(sTID("textStyle"))) return null;
+        return range.getObjectValue(sTID("textStyle"));
+    } catch (e) {
+        return null;
+    }
+}
+
+// Lee el paragraphStyle COMPLETO de la primera run del texto original.
+function readSourceParagraphStyleDescriptor(source) {
+    try {
+        selectLayer(source);
+        var d = getTargetLayerDescriptor();
+        if (!d.hasKey(sTID("textKey"))) return null;
+        var tk = d.getObjectValue(sTID("textKey"));
+        if (!tk.hasKey(sTID("paragraphStyleRange"))) return null;
+        var rl = tk.getList(sTID("paragraphStyleRange"));
+        if (rl.count === 0) return null;
+        var range = rl.getObjectValue(0);
+        if (!range.hasKey(sTID("paragraphStyle"))) return null;
+        return range.getObjectValue(sTID("paragraphStyle"));
+    } catch (e) {
+        return null;
+    }
+}
+
+// Aplica un textStyle (descriptor completo) a TODO el rango de texto de la
+// capa de texto activa. Esto se hace con executeAction("setd") en la capa,
+// pasandole un nuevo textKey con un textStyleRange que cubre todo el texto
+// y referencia el textStyle clonado del original.
+function applyTextStyleToActiveLayer(textStyle, paragraphStyle, contents, log) {
+    try {
+        var textKey = new ActionDescriptor();
+        textKey.putString(cTID("Txt "), contents);
+
+        var range = new ActionDescriptor();
+        range.putInteger(sTID("from"), 0);
+        range.putInteger(sTID("to"), contents.length);
+        range.putObject(sTID("textStyle"), sTID("textStyle"), textStyle);
+
+        var rangeList = new ActionList();
+        rangeList.putObject(sTID("textStyleRange"), range);
+        textKey.putList(sTID("textStyleRange"), rangeList);
+
+        if (paragraphStyle) {
+            var prange = new ActionDescriptor();
+            prange.putInteger(sTID("from"), 0);
+            prange.putInteger(sTID("to"), contents.length);
+            prange.putObject(sTID("paragraphStyle"), sTID("paragraphStyle"), paragraphStyle);
+            var prangeList = new ActionList();
+            prangeList.putObject(sTID("paragraphStyleRange"), prange);
+            textKey.putList(sTID("paragraphStyleRange"), prangeList);
+        }
+
+        applyTextKeyToActiveLayer(textKey);
+        log.writeln("    textStyle completo aplicado al rango entero.");
+    } catch (e) {
+        log.writeln("    WARNING aplicando textStyle: " + e);
+    }
+}
+
+function createRotatedTextLayer(source, entry, log) {
+    var doc = app.activeDocument;
+    var originalName = source.name;
+    var targetLeft = Number(entry.left);
+    var targetTop = Number(entry.top);
+    var targetRight = Number(entry.right);
+    var targetBottom = Number(entry.bottom);
+    var targetWidth = targetRight - targetLeft;
+    var targetHeight = targetBottom - targetTop;
+    var centerX = (targetLeft + targetRight) / 2;
+    var centerY = (targetTop + targetBottom) / 2;
+
+    // 1. Leer info del original ANTES de borrarlo:
+    //    - angulo de rotacion (vive en textShape.transform)
+    //    - textStyle COMPLETO (descriptor con TODAS las propiedades, no solo
+    //      las que expone el DOM textItem)
+    //    - paragraphStyle completo
+    //    - contents
+    var angle = getLayerRotationDegrees(source, log);
+    if (Math.abs(angle) < 0.5) {
+        angle = -90;
+        log.writeln("    rotation fallback: -90 deg (no detectada en textKey)");
+    } else {
+        log.writeln("    rotation detectada: " + angle.toFixed(2) + " deg");
+    }
+    var sourceContents = "";
+    try { sourceContents = source.textItem.contents; } catch (e) {}
+    var sourceTextStyle = readSourceTextStyleDescriptor(source);
+    var sourceParaStyle = readSourceParagraphStyleDescriptor(source);
+    log.writeln("    textStyle leido: " + (sourceTextStyle ? "OK" : "NULL"));
+    log.writeln("    paragraphStyle leido: " + (sourceParaStyle ? "OK" : "NULL"));
+
+    // 2. Crear capa de texto nueva (transform interno LIMPIO).
+    log.writeln("    creando capa de texto nueva...");
+    var newLayer = makeBlankTextLayer(source.parent, entry, source, log);
+    newLayer = doc.activeLayer;
+    newLayer.name = originalName + "__rebuild";
+
+    // 3. Forzar POINT TEXT y aplicar el textStyle COMPLETO del original. Esto
+    // copia EXACTAMENTE font, size, leading, hScale, vScale, tracking,
+    // autoKern, ligature, baselineShift, color, fontCaps, miterLimit, etc.
+    try { newLayer.textItem.kind = TextType.POINTTEXT; } catch (e) {}
+    if (sourceTextStyle && sourceContents.length > 0) {
+        applyTextStyleToActiveLayer(sourceTextStyle, sourceParaStyle, sourceContents, log);
+    } else {
+        // Fallback minimo si no se pudo leer el descriptor.
+        try { newLayer.textItem.font = source.textItem.font; } catch (e) {}
+        try { newLayer.textItem.size = source.textItem.size; } catch (e) {}
+        try { newLayer.textItem.contents = sourceContents || " "; } catch (e) {}
+        log.writeln("    fallback DOM copy aplicado.");
+    }
+    // Re-forzar fuente desde manifest: el descriptor del original puede traer
+    // una fuente sustituta cuando Photoshop la cambia al abrir la capa rota.
+    try {
+        if ((entry.style || {}).font_name) {
+            newLayer.textItem.font = entry.style.font_name;
+            log.writeln("    fuente forzada desde manifest: " + entry.style.font_name);
+        }
+    } catch (e) {
+        log.writeln("    WARNING aplicando fuente del manifest: " + e);
+    }
+
+    // 4. Centrar y rotar.
+    var b0 = layerBounds(newLayer);
+    var dx0 = centerX - (b0.left + b0.right) / 2;
+    var dy0 = centerY - (b0.top + b0.bottom) / 2;
+    if (Math.abs(dx0) > 0.5 || Math.abs(dy0) > 0.5) {
+        try { newLayer.translate(dx0, dy0); } catch (e) {
+            log.writeln("    WARNING translate pre-rotate: " + e);
+        }
+    }
+    try {
+        newLayer.rotate(angle, AnchorPosition.MIDDLECENTER);
+        log.writeln("    rotacion aplicada: " + angle.toFixed(2) + " deg");
+    } catch (e) {
+        log.writeln("    WARNING rotate fallo: " + e);
+    }
+
+    // 5. Reporte de drift. Si pasamos el textStyle entero y la fuente es la
+    // misma, los bounds post-rotacion deberian coincidir con target dentro
+    // de 1-2 px (subpixel rounding del rasterizador).
+    var bPre = layerBounds(newLayer);
+    var driftW = (bPre.right - bPre.left) - targetWidth;
+    var driftH = (bPre.bottom - bPre.top) - targetHeight;
+    var relW = (targetWidth > 0) ? Math.abs(driftW / targetWidth) : 0;
+    var relH = (targetHeight > 0) ? Math.abs(driftH / targetHeight) : 0;
+    log.writeln("    drift bbox post-rotate: dW=" + driftW.toFixed(1) +
+        " dH=" + driftH.toFixed(1) +
+        " (" + (relW * 100).toFixed(2) + "% x " + (relH * 100).toFixed(2) + "%)");
+
+    // 6. Pre-posicionar al top-left antes de escalar (resize con TOPLEFT
+    // anchor preserva la posicion del top-left).
+    moveLayerToTarget(newLayer, targetLeft, targetTop, log);
+
+    // 7. Si el bbox no coincide al pixel con el target, aplicar un resize
+    // correctivo fino. Llamamos resize() directamente (no usamos
+    // scaleLayerToTargetBounds que ignora ajustes < 0.5%) porque queremos
+    // que incluso drifts subpixel queden corregidos. Para drifts de 1-2 px
+    // el escalado es < 4% en el eje chico y < 1% en el grande, imperceptible
+    // en panel Character.
+    var bMeasure = layerBounds(newLayer);
+    var curW = bMeasure.right - bMeasure.left;
+    var curH = bMeasure.bottom - bMeasure.top;
+    if (curW > 0 && curH > 0 &&
+            (Math.abs(curW - targetWidth) >= 0.5 || Math.abs(curH - targetHeight) >= 0.5)) {
+        var sX = 100.0 * targetWidth / curW;
+        var sY = 100.0 * targetHeight / curH;
+        try {
+            newLayer.resize(sX, sY, AnchorPosition.TOPLEFT);
+            log.writeln("    resize correctivo: " + sX.toFixed(3) + "% x " +
+                sY.toFixed(3) + "%");
+        } catch (e) {
+            log.writeln("    WARNING resize correctivo fallo: " + e);
+        }
+    }
+
+    // 8. Re-posicionar exacto al top-left del target (resize puede dejar
+    // micro-drift).
+    var b1 = moveLayerToTarget(newLayer, targetLeft, targetTop, log);
+    var dx1 = targetLeft - b1.left;
+    var dy1 = targetTop - b1.top;
+    if (Math.abs(dx1) > 0.5 || Math.abs(dy1) > 0.5) {
+        b1 = moveLayerToTarget(newLayer, targetLeft, targetTop, log);
+    }
+
+    log.writeln("    copiando presentacion...");
+    copyLayerPresentation(source, newLayer);
+
+    log.writeln("    moviendo junto a la capa original y eliminando original...");
+    newLayer.move(source, ElementPlacement.PLACEBEFORE);
+    newLayer.name = originalName;
+    source.remove();
+
+    log.writeln("    nuevo bounds=(" +
+        Math.round(b1.left) + "," + Math.round(b1.top) + "," +
+        Math.round(b1.right) + "," + Math.round(b1.bottom) + ")");
+}
+
 function createCleanTextLayer(source, entry, log) {
     var doc = app.activeDocument;
     var originalName = source.name;
     var targetLeft = Number(entry.left);
     var targetTop = Number(entry.top);
+    var targetRight = (entry.right !== undefined) ? Number(entry.right) :
+                      (targetLeft + Number(entry.width || 0));
+    var targetBottom = (entry.bottom !== undefined) ? Number(entry.bottom) :
+                       (targetTop + Number(entry.height || 0));
+    var targetWidth = targetRight - targetLeft;
+    var targetHeight = targetBottom - targetTop;
 
     try {
         log.writeln("    parent=" + source.parent.typename + " / " + source.parent.name);
     } catch (pe) {}
-    log.writeln("    creando capa de texto nueva...");
-    var newLayer = makeBlankTextLayer(source.parent, entry, log);
 
+    // Leer metricas EFECTIVAS del descriptor original (lo que Photoshop
+    // muestra en panel Character). NO calcular size como font_size *
+    // matrix_scale: el transform del TyShO puede estar "corrupto" (escala
+    // 3.77) pero la escala VISUAL real del texto suele ser muy distinta
+    // (ej. 1.8) porque Photoshop la compensa internamente. Leer
+    // impliedFontSize evita calcular mal el size de la capa nueva y
+    // produce resize correctivo gigante (45%) que distorsiona.
+    var sourceTextStyleDesc = readSourceTextStyleDescriptor(source);
+    var explicitSize = null;
+    var explicitLeading = null;
+    var explicitAutoLeading = null;
+    var explicitHScale = null;
+    var explicitVScale = null;
+    if (sourceTextStyleDesc) {
+        try {
+            if (sourceTextStyleDesc.hasKey(sTID("impliedFontSize"))) {
+                explicitSize = sourceTextStyleDesc.getUnitDoubleValue(sTID("impliedFontSize"));
+            } else if (sourceTextStyleDesc.hasKey(sTID("size"))) {
+                explicitSize = sourceTextStyleDesc.getUnitDoubleValue(sTID("size"));
+            }
+        } catch (e) {}
+        try {
+            if (sourceTextStyleDesc.hasKey(sTID("autoLeading"))) {
+                explicitAutoLeading = sourceTextStyleDesc.getBoolean(sTID("autoLeading"));
+            }
+        } catch (e) {}
+        try {
+            if (sourceTextStyleDesc.hasKey(sTID("impliedLeading"))) {
+                explicitLeading = sourceTextStyleDesc.getUnitDoubleValue(sTID("impliedLeading"));
+            } else if (sourceTextStyleDesc.hasKey(sTID("leading"))) {
+                explicitLeading = sourceTextStyleDesc.getUnitDoubleValue(sTID("leading"));
+            }
+        } catch (e) {}
+        try {
+            if (sourceTextStyleDesc.hasKey(sTID("horizontalScale"))) {
+                explicitHScale = sourceTextStyleDesc.getDouble(sTID("horizontalScale"));
+            }
+        } catch (e) {}
+        try {
+            if (sourceTextStyleDesc.hasKey(sTID("verticalScale"))) {
+                explicitVScale = sourceTextStyleDesc.getDouble(sTID("verticalScale"));
+            }
+        } catch (e) {}
+    }
+    log.writeln("    metrics descriptor: size=" +
+        (explicitSize !== null ? explicitSize.toFixed(3) + "pt" : "?") +
+        " leading=" + (explicitLeading !== null ? explicitLeading.toFixed(3) + "pt" : "auto") +
+        " hScale=" + (explicitHScale !== null ? explicitHScale.toFixed(2) + "%" : "?") +
+        " autoLeading=" + explicitAutoLeading);
+
+    // Leer paragraphStyle y contents del original ANTES de crear la capa
+    // nueva. Junto con sourceTextStyleDesc, esto permite aplicar el style
+    // COMPLETO via Action Manager (font, color, fontCaps, baseline, ligature,
+    // tracking, etc.). DOM textItem.font NO es confiable en capas con
+    // herencia corrupta — devuelve la fuente default de Photoshop (Myriad
+    // Pro) y el try/catch de copyTextItemBasics lo traga silenciosamente,
+    // perdiendo la fuente original.
+    var sourceParaStyleDesc = readSourceParagraphStyleDescriptor(source);
+    var sourceContents = "";
+    try { sourceContents = source.textItem.contents; } catch (e) {}
+    log.writeln("    textStyle leido: " + (sourceTextStyleDesc ? "OK" : "NULL"));
+    log.writeln("    paragraphStyle leido: " + (sourceParaStyleDesc ? "OK" : "NULL"));
+
+    log.writeln("    creando capa de texto nueva...");
+    var newLayer = makeBlankTextLayer(source.parent, entry, source, log);
     newLayer = doc.activeLayer;
     newLayer.name = originalName + "__rebuild";
+
+    // 1) copyTextItemBasics setea kind, bounds, justification, etc. Si la
+    //    fuente se logra copiar via DOM, perfecto; si no, el paso 2 la repara.
     copyTextItemBasics(source.textItem, newLayer.textItem, entry, log);
-    tuneLeadingToTargetHeight(newLayer, entry, log);
+
+    // 2) Aplicar el textStyle COMPLETO del descriptor del original via Action
+    //    Manager. Esto sobrescribe la fuente con el valor REAL del original
+    //    (fontPostScriptName del descriptor), ignorando lo que el DOM haya
+    //    devuelto. Tambien preserva color, fontCaps, ligature, baselineShift,
+    //    syntheticBold, etc. — propiedades que el DOM no expone todas.
+    if (sourceTextStyleDesc && sourceContents.length > 0) {
+        applyTextStyleToActiveLayer(sourceTextStyleDesc, sourceParaStyleDesc, sourceContents, log);
+        // Re-establecer width/height/position post-setd: aplicar textStyle via
+        // "setd" puede resetear el textShape (bounding box). Para POINTTEXT
+        // width/height son read-only; para PARAGRAPH se reaplican.
+        try { newLayer.textItem.width = UnitValue(Number(entry.width), "px"); } catch (e) {}
+        try { newLayer.textItem.height = UnitValue(Number(entry.height), "px"); } catch (e) {}
+        try { newLayer.textItem.position = [Number(entry.left), Number(entry.top)]; } catch (e) {}
+        // Re-forzar fuente desde el manifest. El nombre del manifest viene de
+        // los bytes crudos del PSD (engine_dict.FontSet) — la unica fuente
+        // confiable. Photoshop verifica al setear: si la fuente NO esta
+        // instalada, sustituye silenciosamente por la default (Myriad Pro).
+        // En ese caso textItem.font tras el set devuelve el nombre sustituto
+        // y queda evidencia en el log para que el operador sepa que tiene
+        // que instalar la fuente.
+        try {
+            if ((entry.style || {}).font_name) {
+                newLayer.textItem.font = entry.style.font_name;
+                var applied = "";
+                try { applied = newLayer.textItem.font; } catch (e) {}
+                if (applied === entry.style.font_name) {
+                    log.writeln("    fuente re-forzada: " + entry.style.font_name + " OK");
+                } else {
+                    log.writeln("    AVISO: fuente '" + entry.style.font_name +
+                        "' NO INSTALADA -> Photoshop sustituyo por '" + applied + "'");
+                }
+            }
+        } catch (e) {
+            log.writeln("    WARNING re-aplicando fuente: " + e);
+        }
+    }
+
+    // Sobrescribir size/leading/hScale/vScale con valores EFECTIVOS del
+    // descriptor (los que Photoshop muestra). Asi el texto queda con las
+    // metricas exactas del original, sin depender de heuristicas con la
+    // matrix del TyShO que puede estar corrupta.
+    try {
+        if (explicitSize !== null && isFinite(explicitSize) && explicitSize > 0) {
+            newLayer.textItem.size = UnitValue(explicitSize, "pt");
+            log.writeln("    size forzado a " + explicitSize.toFixed(3) + "pt.");
+        }
+    } catch (e) {
+        log.writeln("    WARNING aplicando size: " + e);
+    }
+    try {
+        if (explicitAutoLeading === true) {
+            newLayer.textItem.useAutoLeading = true;
+        } else if (explicitLeading !== null && isFinite(explicitLeading) && explicitLeading > 0) {
+            newLayer.textItem.useAutoLeading = false;
+            newLayer.textItem.leading = UnitValue(explicitLeading, "pt");
+            log.writeln("    leading forzado a " + explicitLeading.toFixed(3) + "pt.");
+        }
+    } catch (e) {
+        log.writeln("    WARNING aplicando leading: " + e);
+    }
+    try {
+        if (explicitHScale !== null && isFinite(explicitHScale) && explicitHScale > 0) {
+            newLayer.textItem.horizontalScale = explicitHScale;
+        }
+    } catch (e) {}
+    try {
+        if (explicitVScale !== null && isFinite(explicitVScale) && explicitVScale > 0) {
+            newLayer.textItem.verticalScale = explicitVScale;
+        }
+    } catch (e) {}
 
     // Mover ANTES de escalar: para texto chico que sera muy pequeno post-escala,
     // translate() falla con "Transformar no disponible". Posicionando primero
@@ -516,14 +1141,44 @@ function createCleanTextLayer(source, entry, log) {
     log.writeln("    posicionamiento previo a escala...");
     moveLayerToTarget(newLayer, targetLeft, targetTop, log);
 
-    // Reescalar para igualar bounds. Vertical: scale eje-por-eje (forzamos
-    // ancho de columna). Horizontal: uniforme por altura + ajuste horizontal
-    // para compensar HorizontalScale/VerticalScale del style original que
-    // se pierden al recrear.
-    if (entry.orientation === "vertical") {
-        scaleLayerToTargetBounds(newLayer, entry, log);
-    } else {
-        scaleLayerUniformToHeight(newLayer, entry, log);
+    // Resize correctivo fino al bbox exacto. Con el textStyle completo aplicado
+    // el drift es subpixel; resize() corrige sin alterar leading/size internos
+    // (solo redimensiona visualmente).
+    // Resize correctivo: SOLO si el drift relativo en algun eje es > 1%
+    // del target. Sin esto, drifts de 4-6% (que afectan el impliedFontSize
+    // visible en panel Character) se aplican y distorsionan el tamano del
+    // texto. Para drifts < 1% el ojo no nota la diferencia en bounds, pero
+    // SI nota un texto que cambio de 75pt a 80pt.
+    //
+    // Tambien tope absoluto de 1.5 px: drifts subpixel no requieren resize.
+    var bMeasure = layerBounds(newLayer);
+    var curW = bMeasure.right - bMeasure.left;
+    var curH = bMeasure.bottom - bMeasure.top;
+    if (curW > 0 && curH > 0 && targetWidth > 0 && targetHeight > 0) {
+        var driftX = Math.abs(curW - targetWidth);
+        var driftY = Math.abs(curH - targetHeight);
+        var relX = driftX / targetWidth;
+        var relY = driftY / targetHeight;
+        // Aplicar resize en un eje SOLO si: drift >= 1.5 px Y drift >= 1% del lado.
+        var needX = (driftX >= 1.5) && (relX >= 0.01);
+        var needY = (driftY >= 1.5) && (relY >= 0.01);
+        if (needX || needY) {
+            var sX = needX ? (100.0 * targetWidth / curW) : 100.0;
+            var sY = needY ? (100.0 * targetHeight / curH) : 100.0;
+            try {
+                newLayer.resize(sX, sY, AnchorPosition.TOPLEFT);
+                log.writeln("    resize correctivo: " + sX.toFixed(3) + "% x " +
+                    sY.toFixed(3) + "% (drift " + driftX.toFixed(1) + "px / " +
+                    driftY.toFixed(1) + "px, " + (relX * 100).toFixed(2) + "% x " +
+                    (relY * 100).toFixed(2) + "%)");
+            } catch (e) {
+                log.writeln("    WARNING resize correctivo fallo: " + e);
+            }
+        } else {
+            log.writeln("    drift " + driftX.toFixed(1) + "/" + driftY.toFixed(1) +
+                "px (" + (relX * 100).toFixed(2) + "% x " + (relY * 100).toFixed(2) +
+                "%) bajo threshold; no resize.");
+        }
     }
 
     // Re-ajuste fino post-escala (resize puede causar pequeno drift).
@@ -534,6 +1189,35 @@ function createCleanTextLayer(source, entry, log) {
     if (Math.abs(dx) > 0.5 || Math.abs(dy) > 0.5) {
         b = moveLayerToTarget(newLayer, targetLeft, targetTop, log);
     }
+
+    // RE-APLICAR size/leading/hScale al final: el resize correctivo (cuando
+    // se aplico) distorsiona el style sheet (ej. size 75.612 -> 78.87 tras
+    // resize 104%). Reaplicar despues del resize garantiza que el panel
+    // Character muestre los valores exactos del original.
+    try {
+        if (explicitSize !== null && isFinite(explicitSize) && explicitSize > 0) {
+            newLayer.textItem.size = UnitValue(explicitSize, "pt");
+            log.writeln("    size re-forzado a " + explicitSize.toFixed(3) + "pt (post-resize).");
+        }
+    } catch (e) {}
+    try {
+        if (explicitAutoLeading === true) {
+            newLayer.textItem.useAutoLeading = true;
+        } else if (explicitLeading !== null && isFinite(explicitLeading) && explicitLeading > 0) {
+            newLayer.textItem.useAutoLeading = false;
+            newLayer.textItem.leading = UnitValue(explicitLeading, "pt");
+        }
+    } catch (e) {}
+    try {
+        if (explicitHScale !== null && isFinite(explicitHScale) && explicitHScale > 0) {
+            newLayer.textItem.horizontalScale = explicitHScale;
+        }
+    } catch (e) {}
+    try {
+        if (explicitVScale !== null && isFinite(explicitVScale) && explicitVScale > 0) {
+            newLayer.textItem.verticalScale = explicitVScale;
+        }
+    } catch (e) {}
 
     log.writeln("    copiando presentacion...");
     copyLayerPresentation(source, newLayer);
@@ -597,8 +1281,20 @@ function main() {
                     logFile.writeln("    ERROR: la capa encontrada no es texto.");
                     continue;
                 }
-                createCleanTextLayer(layer, entry, logFile);
-                logFile.writeln("    OK: reconstruida desde capa nueva.");
+                if (entry.is_rotated === true) {
+                    createRotatedTextLayer(layer, entry, logFile);
+                    logFile.writeln("    OK: reconstruida (rotada) desde capa nueva.");
+                } else {
+                    createCleanTextLayer(layer, entry, logFile);
+                    logFile.writeln("    OK: reconstruida desde capa nueva.");
+                }
+                // Liberar memoria entre capas. PSDs grandes (8K x 8K)
+                // pueden llenar scratch space rapido con duplicates +
+                // resizes. purge libera historial deshacer + clipboard.
+                try {
+                    app.purge(PurgeTarget.HISTORYCACHES);
+                    app.purge(PurgeTarget.CLIPBOARDCACHE);
+                } catch (purgeErr) {}
             }
 
             var saveFile = new File(fixedPathFor(doc));

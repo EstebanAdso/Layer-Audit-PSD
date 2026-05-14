@@ -470,7 +470,7 @@ class DetailsPanel(tk.Frame):
             
         layer_data = []
         for p in problems:
-            bl, bt = p['bounds'] 
+            bl, bt = p['bounds']
             layer_data.append({
                 'name': p['name'],
                 'layer_id': p.get('layer_id'),
@@ -484,6 +484,7 @@ class DetailsPanel(tk.Frame):
                 'bottom': p.get('bounds_full', (bl, bt, bl + p['width'], bt + p['height']))[3],
                 'style': p.get('style', {}),
                 'orientation': p.get('orientation', 'horizontal'),
+                'is_rotated': p.get('is_rotated', False),
                 'matrix': p.get('matrix', [1,0,0,1,0,0])
             })
 

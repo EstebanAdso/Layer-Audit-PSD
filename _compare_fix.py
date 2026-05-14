@@ -32,6 +32,7 @@ def build_layer_data(problems):
             'bottom': bf[3],
             'style': p.get('style', {}),
             'orientation': p.get('orientation', 'horizontal'),
+            'is_rotated': p.get('is_rotated', False),
             'matrix': p.get('matrix', [1, 0, 0, 1, 0, 0]),
         })
     return layer_data

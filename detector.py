@@ -117,9 +117,65 @@ def _extract_type_style(layer):
         faux_bold = data.get('FauxBold')
         if faux_bold is not None:
             style['faux_bold'] = bool(faux_bold)
+        # Fuente: leer el indice de Font del run y resolverlo contra el
+        # FontSet del resource_dict de la capa. Los bytes crudos del PSD
+        # son la unica fuente confiable — Photoshop en runtime puede
+        # sustituir la fuente cuando la capa tiene herencia/transform
+        # corruptos, y entonces textItem.font / fontPostScriptName del
+        # descriptor en vivo devuelven la fuente sustituta (ej. Myriad
+        # Pro Regular) en vez de la original.
+        font_idx = data.get('Font')
+        if font_idx is not None:
+            try:
+                rd = layer.resource_dict
+                font_set = rd.get('FontSet', []) if hasattr(rd, 'get') else []
+                if 0 <= int(font_idx) < len(font_set):
+                    font_name = font_set[int(font_idx)].get('Name')
+                    if font_name:
+                        # psd_tools devuelve el nombre con las comillas
+                        # simples literales del formato TyShO crudo
+                        # ("'PPPangramSansRounded-...'"). Hay que limpiarlas
+                        # para que sea un PostScript name valido para PS.
+                        clean = str(font_name).strip()
+                        if len(clean) >= 2 and clean[0] == "'" and clean[-1] == "'":
+                            clean = clean[1:-1]
+                        if clean:
+                            style['font_name'] = clean
+            except Exception:
+                pass
     except Exception:
         pass
     return style
+
+
+def _read_text_orientation_descriptor(layer):
+    """Lee el campo `Ornt` (orientation) del descriptor TyShO de la capa.
+
+    Devuelve 'vertical' si el texto fue creado como texto vertical real
+    (escritura columnar al estilo CJK), 'horizontal' si es horizontal
+    standard, o None si no se pudo leer.
+
+    El bbox visual puede ser alto y delgado incluso con Ornt='Hrzn'
+    cuando la capa fue rotada 90 grados — el campo Ornt solo refleja
+    la direccion natural de escritura del texto, no rotaciones de capa.
+    """
+    try:
+        for blk in layer._record.tagged_blocks.values():
+            data = getattr(blk, 'data', None)
+            if data is None or not hasattr(data, 'text_data'):
+                continue
+            ornt = data.text_data.get(b'Ornt')
+            if ornt is None:
+                continue
+            enum = getattr(ornt, 'enum', None)
+            if enum == b'Vrtc':
+                return 'vertical'
+            if enum == b'Hrzn':
+                return 'horizontal'
+            return None
+    except Exception:
+        return None
+    return None
 
 
 def analyze_smart_objects(smart_objects):
@@ -236,23 +292,35 @@ def check_type_layer(layer, threshold_px=THRESHOLD_PX,
                     tx > doc_width + m or ty > doc_height + m):
                 out_of_canvas = True
 
-        # Extraer orientacion y transform para reconstruccion fiel
+        # Orientacion + rotacion. Distinguimos dos cosas:
+        #   - orientation: direccion natural del texto (horizontal vs vertical
+        #     real / escritura columnar CJK). La fija el campo `Ornt` del TyShO.
+        #   - is_rotated: True si la CAPA fue rotada visualmente (la rotacion
+        #     no aparece en el TyShO transform que lee psd_tools, pero queda
+        #     evidente como un bbox alto y estrecho en un texto horizontal).
         orientation = 'horizontal'
-        try:
-            ed = layer.engine_dict
-            # Intento 1: Editor.TextOrientation
-            if ed and 'Editor' in ed:
-                if ed['Editor'].get('TextOrientation') == 1:
-                    orientation = 'vertical'
-            
-            # Intento 2: Heurística por ratio de dimensiones (si es muy alto y estrecho)
-            # Solo si no estamos seguros.
+        is_rotated = False
+        ornt_field = _read_text_orientation_descriptor(layer)
+        if ornt_field == 'vertical':
+            orientation = 'vertical'
+        else:
+            # Fallback al engine_dict si no pudimos leer el campo Ornt.
+            if ornt_field is None:
+                try:
+                    ed = layer.engine_dict
+                    if ed and 'Editor' in ed:
+                        if ed['Editor'].get('TextOrientation') == 1:
+                            orientation = 'vertical'
+                except Exception:
+                    pass
+            # Texto horizontal con bbox vertical -> capa rotada 90 grados.
             if orientation == 'horizontal' and layer.width > 0:
-                ratio = layer.height / layer.width
+                try:
+                    ratio = layer.height / layer.width
+                except Exception:
+                    ratio = 0
                 if ratio > 5.0 and len(layer.text.strip()) > 2:
-                    orientation = 'vertical'
-        except:
-            pass
+                    is_rotated = True
 
         is_problem = (delta_exceeded and transform_out_of_parent) or out_of_canvas
         reasons = []
@@ -308,6 +376,7 @@ def check_type_layer(layer, threshold_px=THRESHOLD_PX,
             'width': layer.width,
             'height': layer.height,
             'orientation': orientation,
+            'is_rotated': is_rotated,
             'matrix': matrix,
             'transform': (tx, ty),
             'delta': (delta_x, delta_y),
@@ -330,6 +399,7 @@ def check_type_layer(layer, threshold_px=THRESHOLD_PX,
             'width': layer.width,
             'height': layer.height,
             'orientation': 'horizontal',
+            'is_rotated': False,
             'matrix': (1, 0, 0, 1, 0, 0),
             'transform': None,
             'delta': None,

@@ -27,11 +27,4 @@ Thumbs.db
 # PyInstaller
 *.exe
 
-01_Story_fixed.psd
-01_Story.psd
-6758959f566b6618e1b983f8_fixed.psd
-6758959f566b6618e1b983f8.psd
-NATURAS_MUEBLES_EXHIBIDORES.psd
-SeisPlataformas.psd
-textvertical_fixed.psd
-textvertical.psd
+*.psd
