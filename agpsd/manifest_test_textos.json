@@ -1,0 +1,30 @@
+[
+  {
+    "name": "TEXT_VIGENCIA1_01_Story",
+    "left": 199,
+    "top": 939,
+    "right": 881,
+    "bottom": 970
+  },
+  {
+    "name": "TEXT_VIGENCIA2_01_Story",
+    "left": 199,
+    "top": 1078,
+    "right": 881,
+    "bottom": 1119
+  },
+  {
+    "name": "TEXT_VIGENCIA3_01_Story",
+    "left": 199,
+    "top": 1218,
+    "right": 881,
+    "bottom": 1265
+  },
+  {
+    "name": "TEXT_VIGENCIA4_01_Story",
+    "left": 199,
+    "top": 1357,
+    "right": 881,
+    "bottom": 1430
+  }
+]

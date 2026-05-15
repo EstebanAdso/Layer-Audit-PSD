@@ -1,0 +1,65 @@
+[
+  {
+    "name": "TEXT_ATRIBUTO3_MUEBLES_EXHIBIDORDEPISOPALI_50CMX140CM",
+    "left": 999,
+    "top": 7084,
+    "right": 2196,
+    "bottom": 7205
+  },
+  {
+    "name": "TEXT_ATRIBUTO2_MUEBLES_EXHIBIDORDEPISOPALI_50CMX140CM",
+    "left": 997,
+    "top": 6639,
+    "right": 2051,
+    "bottom": 6760
+  },
+  {
+    "name": "TEXT_ATRIBUTO1_MUEBLES_EXHIBIDORDEPISOPALI_50CMX140CM",
+    "left": 997,
+    "top": 6193,
+    "right": 2052,
+    "bottom": 6316
+  },
+  {
+    "name": "TEXT_ATRIBUTO3_MUEBLES_EXHIBIDORDEPISOPALI_40CMX140CM",
+    "left": 3707,
+    "top": 7084,
+    "right": 4903,
+    "bottom": 7205
+  },
+  {
+    "name": "TEXT_ATRIBUTO2_MUEBLES_EXHIBIDORDEPISOPALI_40CMX140CM",
+    "left": 3704,
+    "top": 6639,
+    "right": 4758,
+    "bottom": 6760
+  },
+  {
+    "name": "TEXT_ATRIBUTO1_MUEBLES_EXHIBIDORDEPISOPALI_40CMX140CM",
+    "left": 3704,
+    "top": 6193,
+    "right": 4759,
+    "bottom": 6316
+  },
+  {
+    "name": "TEXT_ATRIBUTO3_MUEBLES_EXHIBIDORDEPISOMETALICO_40CMX140CM",
+    "left": 6170,
+    "top": 7084,
+    "right": 7366,
+    "bottom": 7205
+  },
+  {
+    "name": "TEXT_ATRIBUTO2_MUEBLES_EXHIBIDORDEPISOMETALICO_40CMX140CM",
+    "left": 6167,
+    "top": 6639,
+    "right": 7221,
+    "bottom": 6760
+  },
+  {
+    "name": "TEXT_ATRIBUTO1_MUEBLES_EXHIBIDORDEPISOMETALICO_40CMX140CM",
+    "left": 6167,
+    "top": 6193,
+    "right": 7222,
+    "bottom": 6316
+  }
+]

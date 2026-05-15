@@ -20,18 +20,16 @@ Ejecutar:
 import multiprocessing
 import os
 import platform
-import tempfile
 import threading
-import time
 import tkinter as tk
-from tkinter import messagebox # Añadido
+from tkinter import messagebox
 from concurrent.futures import ProcessPoolExecutor
 from queue import Empty, Queue
 from tkinter import filedialog, ttk
 
 from detector import analyze_psd
 from fixer import fix_layers_in_psd
-from utils import reveal_in_file_manager, check_photoshop_installed # Añadido
+from utils import reveal_in_file_manager, check_node_available
 
 APP_TITLE = "Layer Audit PSD"
 APP_VERSION = "1.6.0"
@@ -54,6 +52,23 @@ WARN        = "#d97706"
 WARN_BG     = "#fef3c7"
 SELECTED_BG = "#eef2ff"
 HOVER_BG    = "#f8fafc"
+
+# --- Typography scale ------------------------------------------------------
+# Pick the closest role instead of declaring a new ('Segoe UI', N) tuple.
+FONT_TITLE     = ('Segoe UI', 13, 'bold')   # panel headings
+FONT_SUBTITLE  = ('Segoe UI', 10)           # subtitles, file paths
+FONT_BODY_BOLD = ('Segoe UI', 10, 'bold')   # row file name, important labels
+FONT_BODY      = ('Segoe UI', 10)           # default text, list items
+FONT_CAPTION   = ('Segoe UI', 9)            # status text, secondary metadata
+FONT_MICRO     = ('Segoe UI', 8)            # paths, version tag, footnotes
+FONT_MONO      = ('Consolas', 9)            # numeric values, layer IDs
+
+# --- Spacing scale (4-px grid) --------------------------------------------
+SPACE_XS = 4
+SPACE_SM = 8
+SPACE_MD = 12
+SPACE_LG = 16
+SPACE_XL = 24
 
 # Estados de analisis por fila
 ST_IDLE    = 'idle'
@@ -98,7 +113,7 @@ class FileRow(tk.Frame):
         self.indicator = tk.Frame(self, bg=BORDER, width=4)
         self.indicator.pack(side='left', fill='y')
 
-        self.body = tk.Frame(self, bg=SURFACE, padx=14, pady=10)
+        self.body = tk.Frame(self, bg=SURFACE, padx=SPACE_LG, pady=SPACE_MD)
         self.body.pack(side='left', fill='both', expand=True)
 
         top = tk.Frame(self.body, bg=SURFACE)
@@ -106,7 +121,7 @@ class FileRow(tk.Frame):
 
         self.name_lbl = tk.Label(
             top, text=self.filename, bg=SURFACE, fg=TEXT,
-            font=('Segoe UI', 10, 'bold'), anchor='w'
+            font=FONT_BODY_BOLD, anchor='w'
         )
         self.name_lbl.pack(side='left')
 
@@ -115,7 +130,7 @@ class FileRow(tk.Frame):
 
         self.reveal_btn = tk.Label(
             actions, text="Carpeta", bg=SURFACE, fg=TEXT_MUTED, cursor='hand2',
-            font=('Segoe UI', 9), padx=6, pady=2
+            font=FONT_CAPTION, padx=SPACE_XS, pady=2
         )
         self.reveal_btn.pack(side='right')
         self.reveal_btn.bind('<Button-1>', self._handle_reveal)
@@ -126,9 +141,9 @@ class FileRow(tk.Frame):
 
         self.run_btn = tk.Label(
             actions, text="▶", bg=SURFACE, fg=PRIMARY, cursor='hand2',
-            font=('Segoe UI', 10, 'bold'), padx=8, pady=2
+            font=FONT_BODY_BOLD, padx=SPACE_SM, pady=2
         )
-        self.run_btn.pack(side='right', padx=(0, 6))
+        self.run_btn.pack(side='right', padx=(0, SPACE_XS))
         self.run_btn.bind('<Button-1>', self._handle_run)
         self.run_btn.bind('<Enter>',
                           lambda e: self._on_run_hover(True))
@@ -137,7 +152,7 @@ class FileRow(tk.Frame):
 
         self.remove_btn = tk.Label(
             actions, text="✕", bg=SURFACE, fg=TEXT_MUTED, cursor='hand2',
-            font=('Segoe UI', 11), padx=6
+            font=('Segoe UI', 11), padx=SPACE_XS
         )
         self.remove_btn.pack(side='right', padx=(2, 0))
         self.remove_btn.bind('<Button-1>', self._handle_remove)
@@ -147,27 +162,41 @@ class FileRow(tk.Frame):
         self.path_lbl = tk.Label(
             self.body, text=_truncate_path(filepath, 80),
             bg=SURFACE, fg=TEXT_MUTED,
-            font=('Segoe UI', 8), anchor='w'
+            font=FONT_MICRO, anchor='w'
         )
-        self.path_lbl.pack(fill='x', pady=(0, 8))
+        self.path_lbl.pack(fill='x', pady=(2, SPACE_SM))
 
         bot = tk.Frame(self.body, bg=SURFACE)
         bot.pack(fill='x')
 
-        self.bar = ttk.Progressbar(
-            bot, length=160, mode='determinate', maximum=100.0,
-            style='File.Horizontal.TProgressbar'
+        # Pill de status — comunicacion primaria del estado de la fila.
+        self.status_pill = tk.Label(
+            bot, text="Pendiente", bg=SURFACE_ALT, fg=TEXT_MUTED,
+            font=FONT_CAPTION, padx=SPACE_SM, pady=2,
+            highlightthickness=0
         )
-        self.bar.pack(side='left', fill='x', expand=True)
+        # Preservar el bg de la pill durante hover/seleccion (que repintan el row).
+        self.status_pill._keep_bg = True
+        self.status_pill.pack(side='left')
 
-        self.status_lbl = tk.Label(
-            bot, text="Pendiente", bg=SURFACE, fg=TEXT_MUTED,
-            font=('Segoe UI', 9), anchor='e', width=24
+        # Detalle opcional a la derecha de la pill (counts, error, etc.)
+        self.status_detail = tk.Label(
+            bot, text="", bg=SURFACE, fg=TEXT_MUTED,
+            font=FONT_CAPTION, anchor='w'
         )
-        self.status_lbl.pack(side='right', padx=(10, 0))
+        self.status_detail.pack(side='left', padx=(SPACE_SM, 0), fill='x',
+                                expand=True)
+
+        # Barra de progreso — solo visible mientras se procesa.
+        self.bar = ttk.Progressbar(
+            bot, length=120, mode='determinate', maximum=100.0,
+            style='Running.Horizontal.TProgressbar'
+        )
+        # bar se hace pack/forget segun estado para no robar espacio en idle.
 
         self._clickable = (self, self.body, top, bot,
-                           self.name_lbl, self.path_lbl, self.status_lbl)
+                           self.name_lbl, self.path_lbl,
+                           self.status_pill, self.status_detail)
         for w in self._clickable:
             w.bind('<Button-1>', self._handle_click)
             w.bind('<Enter>', self._row_hover_in)
@@ -213,61 +242,83 @@ class FileRow(tk.Frame):
         if not self._selected:
             self._set_row_bg(SURFACE)
 
-    def set_state(self, state, result=None):
-        self.state = state
+    def _set_pill(self, text, fg, bg):
+        self.status_pill.config(text=text, fg=fg, bg=bg)
+
+    def _set_detail(self, text, fg=TEXT_MUTED):
+        self.status_detail.config(text=text, fg=fg)
+
+    def _show_bar(self, mode, style_name='Running.Horizontal.TProgressbar'):
+        """mode: 'running' (indeterminate animado) o None (oculta)."""
         try:
             self.bar.stop()
         except tk.TclError:
             pass
+        if mode == 'running':
+            self.bar.config(mode='indeterminate', value=0, style=style_name)
+            if not self.bar.winfo_ismapped():
+                self.bar.pack(side='right', padx=(SPACE_SM, 0))
+            self.bar.start(35)
+        else:
+            if self.bar.winfo_ismapped():
+                self.bar.pack_forget()
+
+    def set_state(self, state, result=None):
+        self.state = state
 
         if state == ST_IDLE:
             self.result = None
-            self.bar.config(mode='determinate', value=0)
             self.indicator.config(bg=BORDER)
-            self.status_lbl.config(text="Pendiente", fg=TEXT_MUTED)
+            self._set_pill("Pendiente", TEXT_MUTED, SURFACE_ALT)
+            self._set_detail("")
+            self._show_bar(None)
             self.run_btn.config(text="▶", fg=PRIMARY, cursor='hand2')
             self.remove_btn.config(fg=TEXT_MUTED, cursor='hand2')
 
         elif state == ST_QUEUED:
-            self.bar.config(mode='determinate', value=0)
             self.indicator.config(bg=PRIMARY_DIM)
-            self.status_lbl.config(text="En cola...", fg=PRIMARY_DIM)
+            self._set_pill("En cola", PRIMARY, SELECTED_BG)
+            self._set_detail("")
+            self._show_bar(None)
             self.run_btn.config(text="…", fg=BORDER, cursor='')
             self.remove_btn.config(fg=BORDER, cursor='')
 
         elif state == ST_RUNNING:
-            self.bar.config(mode='indeterminate', value=0)
-            self.bar.start(35)
             self.indicator.config(bg=PRIMARY)
-            self.status_lbl.config(text="Analizando...", fg=PRIMARY)
+            self._set_pill("Analizando", PRIMARY, SELECTED_BG)
+            self._set_detail("")
+            self._show_bar('running')
             self.run_btn.config(text="…", fg=BORDER, cursor='')
             self.remove_btn.config(fg=BORDER, cursor='')
 
         elif state == ST_FIXING:
-            self.bar.config(mode='indeterminate', value=0)
-            self.bar.start(35)
             self.indicator.config(bg=WARN)
-            self.status_lbl.config(text="REPARANDO...", fg=WARN)
+            self._set_pill("Reparando", WARN, WARN_BG)
+            self._set_detail("")
+            self._show_bar('running', 'Warn.Horizontal.TProgressbar')
             self.run_btn.config(text="…", fg=BORDER, cursor='')
             self.remove_btn.config(fg=BORDER, cursor='')
 
         elif state == ST_FIXED:
-            self.bar.config(mode='determinate', value=100)
             self.indicator.config(bg=OK)
-            self.status_lbl.config(text="REPARADO", fg=OK)
+            self._set_pill("Reparado", OK, OK_BG)
+            self._set_detail("")
+            self._show_bar(None)
             self.run_btn.config(text="↻", fg=PRIMARY, cursor='hand2')
             self.remove_btn.config(fg=TEXT_MUTED, cursor='hand2')
 
         elif state == ST_DONE:
             self.result = result
-            self.bar.config(mode='determinate', value=100)
+            self._show_bar(None)
             self.run_btn.config(text="↻", fg=PRIMARY, cursor='hand2')
             self.remove_btn.config(fg=TEXT_MUTED, cursor='hand2')
-            
-            # Si el nombre del archivo termina en _fixed, marcarlo como reparado
-            if "_fixed.psd" in self.filepath.lower() or "_fixed.psb" in self.filepath.lower():
+
+            # Archivo con sufijo _fixed: tratar como ya-reparado.
+            fp_low = self.filepath.lower()
+            if "_fixed.psd" in fp_low or "_fixed.psb" in fp_low:
                 self.indicator.config(bg=OK)
-                self.status_lbl.config(text="REPARADO", fg=OK)
+                self._set_pill("Reparado", OK, OK_BG)
+                self._set_detail("")
                 return
 
             self._apply_done_visuals(result)
@@ -275,7 +326,8 @@ class FileRow(tk.Frame):
     def _apply_done_visuals(self, result):
         if result is None or result.get('error'):
             self.indicator.config(bg=ERR)
-            self.status_lbl.config(text="Error abriendo PSD", fg=ERR)
+            self._set_pill("Error", ERR, ERR_BG)
+            self._set_detail("no se pudo abrir el PSD", ERR)
             return
 
         text_problems = len(result.get('problems', []))
@@ -286,17 +338,19 @@ class FileRow(tk.Frame):
         if text_problems == 0 and shared_so == 0:
             if total_layers == 0 and total_so == 0:
                 self.indicator.config(bg=BORDER)
-                self.status_lbl.config(text="Sin layers analizables",
-                                       fg=TEXT_MUTED)
+                self._set_pill("Vacio", TEXT_MUTED, SURFACE_ALT)
+                self._set_detail("sin capas analizables")
             else:
                 self.indicator.config(bg=OK)
-                self.status_lbl.config(
-                    text=f"OK ({total_layers} text, {total_so} SO)",
-                    fg=OK
+                self._set_pill("OK", OK, OK_BG)
+                self._set_detail(
+                    f"{total_layers} text · {total_so} SO"
                 )
             return
 
-        # Hay al menos un problema
+        # Hay al menos un problema.
+        self.indicator.config(bg=ERR)
+        self._set_pill("Problemas", ERR, ERR_BG)
         parts = []
         if text_problems:
             parts.append(
@@ -307,12 +361,22 @@ class FileRow(tk.Frame):
                 "1 SO compartido" if shared_so == 1
                 else f"{shared_so} SO compartidos"
             )
-        self.indicator.config(bg=ERR)
-        self.status_lbl.config(text=" + ".join(parts), fg=ERR)
+        self._set_detail(" + ".join(parts), ERR)
 
     def set_selected(self, selected):
         self._selected = selected
         self._set_row_bg(SELECTED_BG if selected else SURFACE)
+        # Reforzar la seleccion engrosando el indicator: cuando esta seleccionado
+        # pasa de 4 a 6 px y, si esta idle, recibe el color PRIMARY para sumar
+        # contraste sobre el simple cambio de fondo.
+        if selected:
+            self.indicator.config(width=6)
+            if self.state == ST_IDLE:
+                self.indicator.config(bg=PRIMARY)
+        else:
+            self.indicator.config(width=4)
+            if self.state == ST_IDLE:
+                self.indicator.config(bg=BORDER)
 
     def _set_row_bg(self, color):
         try:
@@ -323,6 +387,11 @@ class FileRow(tk.Frame):
             pass
 
     def _recursive_bg(self, widget, color):
+        # Algunos widgets tienen color propio (pills) que NO debe ser sobre-
+        # escrito por el repintado de seleccion/hover. Se marcan con
+        # `widget._keep_bg = True` cuando se crean.
+        if getattr(widget, '_keep_bg', False):
+            return
         try:
             widget.config(bg=color)
         except tk.TclError:
@@ -343,20 +412,21 @@ class FileRow(tk.Frame):
 # ===========================================================================
 
 class DetailsPanel(tk.Frame):
-    def __init__(self, parent, on_reveal=None):
+    def __init__(self, parent, on_reveal=None, on_fix=None):
         super().__init__(parent, bg=SURFACE, bd=0, highlightthickness=1,
                          highlightbackground=BORDER, highlightcolor=BORDER)
         self._on_reveal = on_reveal
+        self._on_fix = on_fix
         self.current_row = None
 
         self.header = tk.Frame(self, bg=SURFACE)
-        self.header.pack(fill='x', padx=20, pady=(18, 12))
+        self.header.pack(fill='x', padx=SPACE_XL, pady=(SPACE_LG + 4, SPACE_MD))
 
         title_row = tk.Frame(self.header, bg=SURFACE)
         title_row.pack(fill='x')
         self.title_lbl = tk.Label(
             title_row, text="Detalles", bg=SURFACE, fg=TEXT,
-            font=('Segoe UI', 13, 'bold'), anchor='w'
+            font=FONT_TITLE, anchor='w'
         )
         self.title_lbl.pack(side='left', fill='x', expand=True)
 
@@ -366,38 +436,40 @@ class DetailsPanel(tk.Frame):
         )
 
         self.fix_action_btn = ttk.Button(
-            title_row, text="Corregir en Photoshop",
+            title_row, text="Corregir capas",
             style='Primary.TButton',
             command=self._handle_fix_click
         )
 
         self.subtitle_lbl = tk.Label(
-            self.header, text="Selecciona un archivo a la izquierda para ver el desglose.",
-            bg=SURFACE, fg=TEXT_MUTED, font=('Segoe UI', 9), anchor='w',
+            self.header,
+            text="Selecciona un archivo a la izquierda para ver el desglose.",
+            bg=SURFACE, fg=TEXT_MUTED, font=FONT_CAPTION, anchor='w',
             justify='left', wraplength=420
         )
-        self.subtitle_lbl.pack(fill='x', pady=(4, 0))
+        self.subtitle_lbl.pack(fill='x', pady=(SPACE_XS, 0))
         # Ajusta wraplength dinamicamente al ancho del panel
         self.bind('<Configure>',
                   lambda e: self.subtitle_lbl.config(
                       wraplength=max(200, self.winfo_width() - 60)))
 
         self.badge_holder = tk.Frame(self.header, bg=SURFACE)
-        self.badge_holder.pack(fill='x', pady=(10, 0))
+        self.badge_holder.pack(fill='x', pady=(SPACE_MD, 0))
         self.badge = tk.Label(
             self.badge_holder, text="", bg=SURFACE, fg=TEXT_MUTED,
-            font=('Segoe UI', 9, 'bold'), padx=10, pady=4
+            font=FONT_CAPTION, padx=SPACE_SM, pady=SPACE_XS
         )
+        self.badge._keep_bg = True
 
         tk.Frame(self, bg=BORDER, height=1).pack(fill='x')
 
         body = tk.Frame(self, bg=SURFACE)
-        body.pack(fill='both', expand=True, padx=4, pady=4)
+        body.pack(fill='both', expand=True, padx=SPACE_XS, pady=SPACE_XS)
 
         self.text = tk.Text(
             body, wrap='word', bg=SURFACE, fg=TEXT, bd=0,
-            highlightthickness=0, padx=18, pady=14,
-            font=('Consolas', 10), spacing1=2, spacing3=2, cursor='arrow'
+            highlightthickness=0, padx=SPACE_LG + 2, pady=SPACE_MD,
+            font=FONT_MONO, spacing1=2, spacing3=2, cursor='arrow'
         )
         sb = ttk.Scrollbar(body, command=self.text.yview)
         self.text.configure(yscrollcommand=sb.set)
@@ -408,20 +480,38 @@ class DetailsPanel(tk.Frame):
         self.show_empty()
 
     def _configure_tags(self):
-        self.text.tag_configure('h', font=('Segoe UI', 10, 'bold'),
+        self.text.tag_configure('h', font=FONT_BODY_BOLD,
                                 foreground=TEXT, spacing1=10, spacing3=6)
-        self.text.tag_configure('err',  foreground=ERR,
-                                font=('Segoe UI', 10, 'bold'))
-        self.text.tag_configure('ok',   foreground=OK,
-                                font=('Segoe UI', 10, 'bold'))
-        self.text.tag_configure('warn', foreground=WARN,
-                                font=('Segoe UI', 10, 'bold'))
+        self.text.tag_configure('err',  foreground=ERR, font=FONT_BODY_BOLD)
+        self.text.tag_configure('ok',   foreground=OK,  font=FONT_BODY_BOLD)
+        self.text.tag_configure('warn', foreground=WARN, font=FONT_BODY_BOLD)
         self.text.tag_configure('muted', foreground=TEXT_MUTED,
-                                font=('Segoe UI', 9))
-        self.text.tag_configure('mono', font=('Consolas', 9),
-                                foreground=TEXT)
-        self.text.tag_configure('mono_muted', font=('Consolas', 9),
+                                font=FONT_CAPTION)
+        self.text.tag_configure('mono', font=FONT_MONO, foreground=TEXT)
+        self.text.tag_configure('mono_muted', font=FONT_MONO,
                                 foreground=TEXT_MUTED)
+        # Tags para empty / pending / running states con jerarquia visual.
+        self.text.tag_configure('hero_glyph',
+                                font=('Segoe UI', 36),
+                                foreground=BORDER, justify='center',
+                                spacing1=18, spacing3=4)
+        self.text.tag_configure('hero_title',
+                                font=('Segoe UI', 14, 'bold'),
+                                foreground=TEXT, justify='center',
+                                spacing1=6, spacing3=4)
+        self.text.tag_configure('hero_caption',
+                                font=FONT_BODY, foreground=TEXT_MUTED,
+                                justify='center',
+                                lmargin1=24, lmargin2=24, rmargin=24,
+                                spacing1=2, spacing3=2)
+        self.text.tag_configure('bullet_label',
+                                font=FONT_CAPTION, foreground=TEXT,
+                                lmargin1=32, lmargin2=44,
+                                spacing1=6, spacing3=2)
+        self.text.tag_configure('bullet_muted',
+                                font=FONT_CAPTION, foreground=TEXT_MUTED,
+                                lmargin1=32, lmargin2=44, rmargin=24,
+                                spacing1=0, spacing3=2)
         # Caja de sugerencia: padding lateral consistente, padding vertical
         # justo (no exagerado).
         self.text.tag_configure('hint_box', background=WARN_BG,
@@ -454,50 +544,38 @@ class DetailsPanel(tk.Frame):
     def _handle_fix_click(self):
         if not self.current_row or not self.current_row.result:
             return
-        
-        # Verificar si Photoshop está instalado antes de proceder
-        if not check_photoshop_installed():
+
+        # El nuevo motor de reparacion corre en Node + ag-psd, no Photoshop.
+        if not check_node_available():
             messagebox.showerror(
-                "Photoshop no detectado",
-                "No se pudo encontrar una instalación válida de Adobe Photoshop en este sistema.\n\n"
-                "La función de reparación automática requiere Photoshop instalado para funcionar."
+                "Node.js no detectado",
+                "El motor de reparacion requiere Node.js instalado y accesible "
+                "en el PATH.\n\nDescargalo desde https://nodejs.org/ "
+                "(version 18 o superior)."
             )
             return
 
         problems = self.current_row.result.get('problems', [])
         if not problems:
             return
-            
+
         layer_data = []
         for p in problems:
             bl, bt = p['bounds']
             layer_data.append({
                 'name': p['name'],
-                'layer_id': p.get('layer_id'),
-                'template_layer_id': p.get('template_layer_id'),
-                'template_layer_name': p.get('template_layer_name'),
                 'width': p['width'],
                 'height': p['height'],
                 'left': bl,
                 'top': bt,
                 'right': p.get('bounds_full', (bl, bt, bl + p['width'], bt + p['height']))[2],
                 'bottom': p.get('bounds_full', (bl, bt, bl + p['width'], bt + p['height']))[3],
-                'style': p.get('style', {}),
-                'orientation': p.get('orientation', 'horizontal'),
-                'is_rotated': p.get('is_rotated', False),
-                'matrix': p.get('matrix', [1,0,0,1,0,0])
             })
 
-        psd_path = self.current_row.filepath
         row = self.current_row
         row.set_state(ST_FIXING)
-        row._fix_start_time = time.time() # Para el watchdog
-
-        def _run_fix():
-            # Lanzamiento asíncrono vía Popen ya implementado en fixer.py
-            fix_layers_in_psd(psd_path, layer_data)
-
-        threading.Thread(target=_run_fix, daemon=True).start()
+        if self._on_fix:
+            self._on_fix(row, layer_data)
 
     def _update_action_bar(self, row):
         if row is None:
@@ -549,16 +627,22 @@ class DetailsPanel(tk.Frame):
 
         self.text.config(state='normal')
         self.text.delete('1.0', 'end')
+        # Hero centrado: glyph + titulo + caption + checklist preview.
+        self.text.insert('end', "\n", 'muted')
+        self.text.insert('end', "□\n", 'hero_glyph')
+        self.text.insert('end', "Nada seleccionado\n", 'hero_title')
         self.text.insert('end',
-            "\n  Carga uno o mas archivos PSD usando el boton 'Agregar PSDs'.\n\n",
-            'muted')
+            "Carga uno o mas PSD a la izquierda y pulsa Analizar Todo.\n\n",
+            'hero_caption')
         self.text.insert('end',
-            "  Despues de analizar veras aqui:\n", 'muted')
-        self.text.insert('end',
-            "    • Cuales text layers estan desincronizados.\n"
-            "    • La diferencia exacta entre bounds visuales y transform interno.\n"
-            "    • Smart objects compartidos que requieren accion manual.\n",
-            'muted')
+            "Despues del analisis veras aqui:\n", 'bullet_label')
+        for line in (
+            "  text layers con transform desincronizado",
+            "  delta exacta entre bounds visuales y transform interno",
+            "  shape type (point vs paragraph) y orientacion",
+            "  smart objects compartidos que requieren accion manual",
+        ):
+            self.text.insert('end', f"• {line.strip()}\n", 'bullet_muted')
         self.text.config(state='disabled')
 
     def show_pending(self, row):
@@ -570,25 +654,29 @@ class DetailsPanel(tk.Frame):
         self._update_action_bar(row)
         self.text.config(state='normal')
         self.text.delete('1.0', 'end')
+        self.text.insert('end', "\n", 'muted')
+        self.text.insert('end', "○\n", 'hero_glyph')
+        self.text.insert('end', "Aun sin analizar\n", 'hero_title')
         self.text.insert('end',
-            "\n  Aun no se ha analizado este archivo.\n"
-            "  Pulsa ▶ en la fila o 'Analizar Todo' para procesarlo.\n",
-            'muted')
+            "Pulsa ▶ en la fila o Analizar Todo para procesar este archivo.",
+            'hero_caption')
         self.text.config(state='disabled')
 
     def show_running(self, row):
         self.current_row = row
         self.title_lbl.config(text=row.filename)
         self.subtitle_lbl.config(text=_truncate_path(row.filepath, 90))
-        self._set_badge("Analizando...", PRIMARY, SELECTED_BG)
+        self._set_badge("Analizando", PRIMARY, SELECTED_BG)
         self._show_reveal_btn(True)
         self._update_action_bar(row)
         self.text.config(state='normal')
         self.text.delete('1.0', 'end')
+        self.text.insert('end', "\n", 'muted')
+        self.text.insert('end', "◎\n", 'hero_glyph')
+        self.text.insert('end', "Procesando\n", 'hero_title')
         self.text.insert('end',
-            "\n  Procesando archivo...\n"
-            "  Para PSDs grandes esto puede tardar unos segundos.\n",
-            'muted')
+            "Para PSDs grandes esto puede tardar varios segundos.",
+            'hero_caption')
         self.text.config(state='disabled')
 
     def show_result(self, row):
@@ -805,6 +893,7 @@ class App(tk.Tk):
         # Los grupos suelen contener assets compartidos entre plataformas
         # (logos, legales fijos) que el equipo no piensa modificar via API.
         self.skip_groups_var = tk.BooleanVar(value=True)
+        self.ignore_point_var = tk.BooleanVar(value=True)
 
         self._build_ui()
         self._bind_mousewheel()
@@ -841,10 +930,16 @@ class App(tk.Tk):
                               ('disabled', PRIMARY_DIM)],
                   foreground=[('disabled', '#ffffff')])
 
-        style.configure('File.Horizontal.TProgressbar',
-                        troughcolor=BORDER, background=PRIMARY,
-                        bordercolor=BORDER, lightcolor=PRIMARY,
-                        darkcolor=PRIMARY, thickness=6)
+        # Progressbar variants para reflejar estado en la fila.
+        for name, color in (('Running', PRIMARY),
+                            ('Warn', WARN),
+                            ('Ok', OK),
+                            ('Err', ERR)):
+            style.configure(f'{name}.Horizontal.TProgressbar',
+                            troughcolor=SURFACE_ALT, background=color,
+                            bordercolor=SURFACE_ALT,
+                            lightcolor=color, darkcolor=color,
+                            thickness=4)
 
         # Scrollbar visible: thumb gris medio sobre track claro, hover mas oscuro.
         style.configure('Vertical.TScrollbar',
@@ -897,34 +992,71 @@ class App(tk.Tk):
                         highlightbackground=BORDER, highlightcolor=BORDER)
         left.grid(row=0, column=0, sticky='nsew', padx=(0, 10))
 
-        toolbar = tk.Frame(left, bg=SURFACE)
-        toolbar.pack(fill='x', padx=14, pady=14)
+        # Fila 1: acciones principales. La accion primaria (Analizar Todo)
+        # se ancla a la derecha y no comparte fila con los filtros para que
+        # nunca quede recortada en ventanas estrechas.
+        actions_bar = tk.Frame(left, bg=SURFACE)
+        actions_bar.pack(fill='x', padx=14, pady=(14, 6))
 
-        self.add_btn = ttk.Button(toolbar, text="+ Agregar PSDs",
+        self.add_btn = ttk.Button(actions_bar, text="+ Agregar PSDs",
                                   command=self.add_files)
         self.add_btn.pack(side='left')
 
-        self.clear_btn = ttk.Button(toolbar, text="Limpiar",
+        self.clear_btn = ttk.Button(actions_bar, text="Limpiar",
                                     command=self.clear_files)
         self.clear_btn.pack(side='left', padx=(6, 0))
 
-        # Checkbox para ignorar grupos (layers dentro de carpetas)
-        self.skip_groups_cb = ttk.Checkbutton(
-            toolbar, text="Ignorar carpetas",
-            variable=self.skip_groups_var
-        )
-        self.skip_groups_cb.pack(side='left', padx=(12, 0))
-
-        # Boton informativo "?" — abre un popover corto que explica la app
-        self.info_btn = ttk.Button(toolbar, text="?",
-                                    width=3,
-                                    command=self._show_info_popup)
-        self.info_btn.pack(side='left', padx=(8, 0))
-
-        self.analyze_btn = ttk.Button(toolbar, text="Analizar Todo",
+        self.analyze_btn = ttk.Button(actions_bar, text="Analizar Todo",
                                       command=self.analyze_all,
                                       style='Primary.TButton')
         self.analyze_btn.pack(side='right')
+
+        self.info_btn = ttk.Button(actions_bar, text="?",
+                                    width=3,
+                                    command=self._show_info_popup)
+        self.info_btn.pack(side='right', padx=(0, 6))
+
+        # Fila 2: filtros de analisis. Visualmente subordinados a las
+        # acciones — fondo levemente distinto, label "Filtros:" como ancla.
+        filters_bar = tk.Frame(left, bg=SURFACE_ALT)
+        filters_bar.pack(fill='x', pady=(0, 0))
+
+        filters_inner = tk.Frame(filters_bar, bg=SURFACE_ALT)
+        filters_inner.pack(fill='x', padx=14, pady=8)
+
+        tk.Label(filters_inner, text="Filtros:",
+                 bg=SURFACE_ALT, fg=TEXT_MUTED,
+                 font=('Segoe UI', 9)).pack(side='left', padx=(0, 8))
+
+        # Para usar el fondo SURFACE_ALT necesitamos un style propio: ttk
+        # Checkbutton no respeta `bg` en tk.Frame padres con fondo custom.
+        cb_style = ttk.Style()
+        cb_style.configure('Filter.TCheckbutton',
+                           background=SURFACE_ALT,
+                           foreground=TEXT)
+        cb_style.map('Filter.TCheckbutton',
+                     background=[('active', SURFACE_ALT)])
+
+        # Ignora capas dentro de Groups normales (no Artboards). Los Groups
+        # suelen tener assets fijos del equipo (logos, legales) que no
+        # entran en automatizaciones.
+        self.skip_groups_cb = ttk.Checkbutton(
+            filters_inner, text="Ignorar carpetas",
+            variable=self.skip_groups_var,
+            style='Filter.TCheckbutton',
+        )
+        self.skip_groups_cb.pack(side='left')
+
+        # Ignora text layers de tipo point. La Photoshop API los posiciona
+        # bien aun con herencia rota (visual = tx + xx*boundingBox.left),
+        # asi que por default no los reportamos. Desactivar para auditar
+        # habitos del equipo aun si no impactan la pipeline.
+        self.ignore_point_cb = ttk.Checkbutton(
+            filters_inner, text="Ignorar capas point",
+            variable=self.ignore_point_var,
+            style='Filter.TCheckbutton',
+        )
+        self.ignore_point_cb.pack(side='left', padx=(16, 0))
 
         tk.Frame(left, bg=BORDER, height=1).pack(fill='x')
 
@@ -978,18 +1110,19 @@ class App(tk.Tk):
         footer.pack(fill='x')
         self.summary_lbl = tk.Label(
             footer, text="Carga uno o mas PSD para empezar.",
-            bg=SURFACE_ALT, fg=TEXT_MUTED, font=('Segoe UI', 9),
-            anchor='w', padx=14, pady=10
+            bg=SURFACE_ALT, fg=TEXT_MUTED, font=FONT_CAPTION,
+            anchor='w', padx=SPACE_LG, pady=SPACE_MD - 2
         )
         self.summary_lbl.pack(side='left', fill='x', expand=True)
         tk.Label(footer,
                  text=f"v{APP_VERSION}",
-                 bg=SURFACE_ALT, fg=TEXT_MUTED, font=('Segoe UI', 8),
-                 padx=14).pack(side='right')
+                 bg=SURFACE_ALT, fg=TEXT_MUTED, font=FONT_MICRO,
+                 padx=SPACE_LG).pack(side='right')
 
         self.details = DetailsPanel(
             body,
             on_reveal=self._reveal_row,
+            on_fix=self._start_fix,
         )
         self.details.grid(row=0, column=1, sticky='nsew')
 
@@ -1232,6 +1365,25 @@ class App(tk.Tk):
     def _reveal_row(self, row):
         reveal_in_file_manager(row.filepath)
 
+    def _start_fix(self, row, layer_data):
+        """Lanza la reparacion en un thread y encola el resultado al
+        terminar. La UI se actualiza desde _poll_queue (main thread)."""
+        psd_path = row.filepath
+        q = self.queue
+
+        def _run_fix():
+            try:
+                ok = fix_layers_in_psd(psd_path, layer_data)
+                err = None if ok else (
+                    'La reparacion fallo. Revisa psd_fix_log.txt en '
+                    'la carpeta temp del sistema.'
+                )
+            except Exception as e:
+                ok, err = False, str(e)
+            q.put(('fix_done', row, ok, err))
+
+        threading.Thread(target=_run_fix, daemon=True).start()
+
     def _ensure_executor(self):
         if self.executor is None:
             ctx = multiprocessing.get_context('spawn')
@@ -1275,9 +1427,11 @@ class App(tk.Tk):
             # Snapshot del flag al momento de submit, asi cambios posteriores
             # del checkbox no afectan analisis ya en cola.
             skip_groups = bool(self.skip_groups_var.get())
+            ignore_point = bool(self.ignore_point_var.get())
             future = executor.submit(
                 analyze_psd, row.filepath,
                 skip_groups=skip_groups,
+                ignore_point_text=ignore_point,
             )
             future.add_done_callback(
                 lambda f, r=row: self._on_future_done(r, f)
@@ -1295,40 +1449,13 @@ class App(tk.Tk):
         self.queue.put(('done', row, result))
 
     def _poll_queue(self):
-        # 1. Monitorear señal de Photoshop para actualización automática
-        temp_dir = tempfile.gettempdir()
-        done_path = os.path.join(temp_dir, "psd_fix_done.txt")
-        
-        if os.path.exists(done_path):
-            try:
-                os.remove(done_path)
-                # Buscar la fila que estaba reparando
-                for r in self.rows:
-                    if r.state == ST_FIXING:
-                        r.set_state(ST_FIXED, result=r.result)
-                        if self.selected_row is r:
-                            self.details.show_result(r)
-                        break
-            except:
-                pass
-
-        # 2. Watchdog para evitar que el estado "REPARANDO..." se quede infinito
-        now = time.time()
-        for r in self.rows:
-            if r.state == ST_FIXING:
-                # Si lleva más de 60 segundos reparando, asumimos que PS falló o se cerró
-                start_time = getattr(r, '_fix_start_time', 0)
-                if start_time > 0 and (now - start_time) > 60:
-                    r.set_state(ST_DONE, result=r.result)
-                    if self.selected_row is r:
-                        self.details.show_result(r)
-
-        # 3. Procesar cola de resultados de análisis
+        # Procesa los mensajes encolados por los workers (analisis y fix).
         any_done = False
         try:
             while True:
                 msg = self.queue.get_nowait()
-                if msg[0] == 'done':
+                kind = msg[0]
+                if kind == 'done':
                     _, row, result = msg
                     self.active_count = max(0, self.active_count - 1)
                     any_done = True
@@ -1336,6 +1463,20 @@ class App(tk.Tk):
                         row.set_state(ST_DONE, result=result)
                         if self.selected_row is row:
                             self.details.show_result(row)
+                elif kind == 'fix_done':
+                    _, row, ok, err = msg
+                    if not row.winfo_exists():
+                        continue
+                    if ok:
+                        row.set_state(ST_FIXED, result=row.result)
+                    else:
+                        row.set_state(ST_DONE, result=row.result)
+                        messagebox.showerror(
+                            "Error al reparar",
+                            err or "No se pudo reparar el archivo."
+                        )
+                    if self.selected_row is row:
+                        self.details.show_result(row)
         except Empty:
             pass
 

@@ -41,19 +41,40 @@ def check_photoshop_installed():
             except FileNotFoundError:
                 # Segundo intento: buscar en App Paths
                 try:
-                    with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, 
+                    with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
                                         r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\Photoshop.exe") as key:
                         return True
                 except FileNotFoundError:
                     return False
-        
+
         elif sysname == 'Darwin':
             # En Mac usamos 'mdfind' para buscar por Bundle ID o el comando open con -Ra
             # 'open -Ra "Adobe Photoshop"' devuelve 0 si existe
-            res = subprocess.run(['open', '-Ra', 'Adobe Photoshop'], 
+            res = subprocess.run(['open', '-Ra', 'Adobe Photoshop'],
                                  capture_output=True, text=True)
             return res.returncode == 0
-        
+
         return True # En otros sistemas no controlamos pero dejamos pasar
+    except Exception:
+        return False
+
+
+def check_node_available():
+    """Verifica si Node.js esta instalado y accesible en el PATH.
+
+    El nuevo motor de reparacion corre en Node (ag-psd) en vez de Photoshop.
+    """
+    try:
+        # En Windows 'node' es node.exe; subprocess lo resuelve via PATH.
+        # creationflags evita una ventana de consola flash en Win.
+        creationflags = 0
+        if platform.system() == 'Windows' and hasattr(subprocess, 'CREATE_NO_WINDOW'):
+            creationflags = subprocess.CREATE_NO_WINDOW
+        res = subprocess.run(
+            ['node', '--version'],
+            capture_output=True, text=True, timeout=5,
+            creationflags=creationflags,
+        )
+        return res.returncode == 0
     except Exception:
         return False

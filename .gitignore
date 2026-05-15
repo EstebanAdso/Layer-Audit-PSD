@@ -28,3 +28,8 @@ Thumbs.db
 *.exe
 
 *.psd
+
+agpsd/node_modules/
+agpsd/package-lock.json
+PSDs
+CLAUDE.md

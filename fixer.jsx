@@ -166,6 +166,167 @@ function applyTextKeyToActiveLayer(textKey) {
     executeAction(cTID("setd"), desc, DialogModes.NO);
 }
 
+// Normaliza el transform corrupto de un text layer SIN recrear la capa.
+// Tecnica del script Undeform (Jaroslav Bereza, MIT) + extensiones para
+// nuestro caso de copy-paste entre artboards:
+//
+// Undeform original ([M] Undeform 1.1.jsx, mightyplugins.cc): para deshacer
+// free transform, hace textKey.erase('transform') + put identity con tx=ty=0,
+// y resetea warp. Confia en textClickPoint para el anchor.
+//
+// Nuestra extension: en copy-paste entre artboards, textClickPoint quedo
+// apuntando al artboard ORIGINAL, no al nuevo. Por eso seteamos tx/ty al
+// top-left visual ACTUAL (bounds.left/bounds.top), y tambien actualizamos
+// textClickPoint y textShape.transform para que todos los anchors apunten al
+// mismo lugar visual. NO compensamos impliedFontSize: el tamano visual lo
+// determina impliedFontSize directamente (size POST-transform en panel
+// Character) — al cambiar transform a identity, el visual se preserva
+// porque impliedFontSize ya es el valor "absoluto" que Photoshop muestra.
+//
+//   1. Lee el textKey COMPLETO (font, color, styles, contents — intactos).
+//   2. textKey.erase('transform') + put nuevo desc [1,0,0,1, targetLeft,
+//      targetTop] — identidad con anchor en el bbox visual.
+//   3. textKey.erase('warp') + put warpNone (limpia cualquier warp).
+//   4. Update textClickPoint al top-left visual (Hrzn/Vrtc en pixeles).
+//   5. Para PARAGRAPH text: resetea textShape[].transform tambien.
+//   6. applyTextKeyToActiveLayer(textKey) — setd reemplaza todo el textKey.
+//   7. Verifica bounds post-setd. Si drift > 50px, retorna false → fallback.
+//
+// Ventaja sobre recreate: NUNCA toca fontPostScriptName / Font index.
+// La capa sigue siendo la misma — su font, color, fontset, todo persiste.
+// Funciona incluso si la fuente no esta instalada (el name reference queda
+// preservado en el textStyleRange para cuando alguien instale la fuente).
+//
+// Limitaciones:
+//   - Solo para texto SIN rotacion (xy=yx=0). Rotado va por createRotatedTextLayer.
+//   - Si drift post-setd > 50px, cae a recreate.
+function normalizeTextLayerInPlace(layer, entry, log) {
+    var targetLeft = Number(entry.left);
+    var targetTop = Number(entry.top);
+
+    selectLayer(layer);
+
+    var desc;
+    try {
+        desc = getTargetLayerDescriptor();
+    } catch (e) {
+        log.writeln("    normalize: no se pudo leer descriptor: " + e);
+        return false;
+    }
+    if (!desc.hasKey(sTID("textKey"))) {
+        log.writeln("    normalize: capa sin textKey, skip");
+        return false;
+    }
+    var textKey = desc.getObjectValue(sTID("textKey"));
+
+    // Inspecciona el transform actual para decidir si esta corrupto o si tiene
+    // rotacion/shear (que va por otro path).
+    var xx = 1, yy = 1, xy = 0, yx = 0, txOrig = 0, tyOrig = 0;
+    if (textKey.hasKey(sTID("transform"))) {
+        var tr = textKey.getObjectValue(sTID("transform"));
+        try { xx = tr.getDouble(sTID("xx")); } catch (e) {}
+        try { yy = tr.getDouble(sTID("yy")); } catch (e) {}
+        try { xy = tr.getDouble(sTID("xy")); } catch (e) {}
+        try { yx = tr.getDouble(sTID("yx")); } catch (e) {}
+        try { txOrig = tr.getDouble(sTID("tx")); } catch (e) {}
+        try { tyOrig = tr.getDouble(sTID("ty")); } catch (e) {}
+    }
+    if (Math.abs(xy) > 0.001 || Math.abs(yx) > 0.001) {
+        log.writeln("    normalize: rotacion/shear detectado (xy=" + xy +
+            " yx=" + yx + "), skip -> recreate path");
+        return false;
+    }
+    var bPre = layerBounds(layer);
+    log.writeln("    normalize: bounds PRE=(" +
+        Math.round(bPre.left) + "," + Math.round(bPre.top) + "," +
+        Math.round(bPre.right) + "," + Math.round(bPre.bottom) +
+        ") xx=" + xx.toFixed(3) + " yy=" + yy.toFixed(3) +
+        " tx_inner=" + Math.round(txOrig) + " ty_inner=" + Math.round(tyOrig) +
+        " target=(" + Math.round(targetLeft) + "," + Math.round(targetTop) + ")");
+
+    // 1) Replace transform con identity en (0, 0) — patron EXACTO de Undeform.
+    //    Intentar tx/ty=target en el INNER transform causa que Photoshop
+    //    rechace con "resultado demasiado grande" porque inner transform.tx/ty
+    //    no esta en coords de canvas. Identity en (0,0) siempre es valida —
+    //    Photoshop posiciona el texto en textClickPoint (que actualizamos abajo).
+    textKey.erase(sTID("transform"));
+    var newTransform = new ActionDescriptor();
+    newTransform.putDouble(sTID("xx"), 1.0);
+    newTransform.putDouble(sTID("xy"), 0.0);
+    newTransform.putDouble(sTID("yx"), 0.0);
+    newTransform.putDouble(sTID("yy"), 1.0);
+    newTransform.putDouble(sTID("tx"), 0.0);
+    newTransform.putDouble(sTID("ty"), 0.0);
+    textKey.putObject(cTID("Trnf"), cTID("Trnf"), newTransform);
+
+    // 2) Reset warp to none (Undeform pattern — limpia cualquier deformacion).
+    textKey.erase(sTID("warp"));
+    var newWarp = new ActionDescriptor();
+    newWarp.putEnumerated(sTID("warpStyle"), sTID("warpStyle"), sTID("warpNone"));
+    newWarp.putDouble(sTID("warpValue"), 0);
+    newWarp.putDouble(sTID("warpPerspective"), 0);
+    newWarp.putDouble(sTID("warpPerspectiveOther"), 0);
+    newWarp.putEnumerated(sTID("warpRotate"), sTID("Ornt"), sTID("Hrzn"));
+    textKey.putObject(sTID("warp"), sTID("warp"), newWarp);
+
+    // NOTA: textClickPoint NO se toca aqui. Setearlo con coords grandes
+    // (target en pixels) hace fallar el setd con "resultado demasiado grande".
+    // En el patron Undeform, textClickPoint queda intacto y el texto se
+    // posiciona en esa coord post-setd. Si quedo en lugar incorrecto, se
+    // ajusta con AM move despues.
+
+    // 4) setd del textKey completo modificado.
+    try {
+        applyTextKeyToActiveLayer(textKey);
+    } catch (eApply) {
+        log.writeln("    normalize: setd fallo: " + eApply);
+        return false;
+    }
+
+    // 5) Si la posicion no quedo exacta, ajustar via AM move repetidamente
+    //    hasta llegar al target. Translate DOM se clampea (parece artboard
+    //    o canvas limit), por eso iteramos con AM move en pasos chunked.
+    var bAfter = layerBounds(layer);
+    log.writeln("    normalize: bounds POST-setd=(" +
+        Math.round(bAfter.left) + "," + Math.round(bAfter.top) + "," +
+        Math.round(bAfter.right) + "," + Math.round(bAfter.bottom) + ")");
+
+    for (var moveIter = 0; moveIter < 15; moveIter++) {
+        var bCur = layerBounds(layer);
+        var dxNow = targetLeft - bCur.left;
+        var dyNow = targetTop - bCur.top;
+        if (Math.abs(dxNow) <= 0.5 && Math.abs(dyNow) <= 0.5) break;
+        // Limita el desplazamiento a 1000px por iteracion para evitar clamping
+        // (las pruebas muestran que translate de >~6000px se trunca a ~400px).
+        var stepX = (Math.abs(dxNow) > 1000) ? (dxNow > 0 ? 1000 : -1000) : dxNow;
+        var stepY = (Math.abs(dyNow) > 1000) ? (dyNow > 0 ? 1000 : -1000) : dyNow;
+        try {
+            selectLayer(layer);
+            moveActiveLayerBy(stepX, stepY);
+            log.writeln("    normalize: AM move iter " + (moveIter + 1) +
+                " step=(" + Math.round(stepX) + "," + Math.round(stepY) + ")");
+        } catch (eAM) {
+            log.writeln("    normalize: AM move fallo: " + eAM);
+            break;
+        }
+    }
+
+    var bFinal = layerBounds(layer);
+    var dx = bFinal.left - targetLeft;
+    var dy = bFinal.top - targetTop;
+    log.writeln("    normalize: bounds FINAL=(" +
+        Math.round(bFinal.left) + "," + Math.round(bFinal.top) + "," +
+        Math.round(bFinal.right) + "," + Math.round(bFinal.bottom) +
+        ") drift=(" + Math.round(dx) + "," + Math.round(dy) + ")");
+
+    if (Math.abs(dx) > 50 || Math.abs(dy) > 50) {
+        log.writeln("    normalize: drift fuera de tolerancia, abort -> recreate");
+        return false;
+    }
+
+    return true;
+}
+
 function normalizeActiveTextTransform(targetLeft, targetTop, log) {
     var active = app.activeDocument.activeLayer;
     var textKey = getTextKeyDescriptor(active);
@@ -1281,12 +1442,33 @@ function main() {
                     logFile.writeln("    ERROR: la capa encontrada no es texto.");
                     continue;
                 }
-                if (entry.is_rotated === true) {
-                    createRotatedTextLayer(layer, entry, logFile);
-                    logFile.writeln("    OK: reconstruida (rotada) desde capa nueva.");
-                } else {
-                    createCleanTextLayer(layer, entry, logFile);
-                    logFile.writeln("    OK: reconstruida desde capa nueva.");
+                // Estrategia: PRIMERO intentar normalize in-place (preserva
+                // font 100%, no recrea la capa, no depende de que la fuente
+                // este instalada). Solo aplica para texto no rotado — para
+                // rotado, recreate sigue siendo el path correcto.
+                //
+                // Si normalize falla (drift muy grande, capa con rotacion,
+                // descriptor sin transform, error de setd), cae al recreate
+                // existente (createCleanTextLayer / createRotatedTextLayer).
+                var handled = false;
+                if (entry.is_rotated !== true) {
+                    try {
+                        if (normalizeTextLayerInPlace(layer, entry, logFile)) {
+                            logFile.writeln("    OK: normalizado in-place (font preservado).");
+                            handled = true;
+                        }
+                    } catch (normErr) {
+                        logFile.writeln("    WARNING normalize fallo: " + normErr);
+                    }
+                }
+                if (!handled) {
+                    if (entry.is_rotated === true) {
+                        createRotatedTextLayer(layer, entry, logFile);
+                        logFile.writeln("    OK: reconstruida (rotada) desde capa nueva (fallback).");
+                    } else {
+                        createCleanTextLayer(layer, entry, logFile);
+                        logFile.writeln("    OK: reconstruida desde capa nueva (fallback).");
+                    }
                 }
                 // Liberar memoria entre capas. PSDs grandes (8K x 8K)
                 // pueden llenar scratch space rapido con duplicates +

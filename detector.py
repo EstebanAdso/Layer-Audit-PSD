@@ -148,6 +148,37 @@ def _extract_type_style(layer):
     return style
 
 
+def _read_shape_type(layer):
+    """Devuelve 'point' o 'box' segun el tipo de la capa de texto.
+
+    Lee el campo `ShapeType` del EngineData (no del TyShO descriptor).
+    Path: engine_dict.Rendered.Shapes.Children[0].ShapeType
+    Valores: 0 = point text, 1 = paragraph (box).
+
+    Es importante porque la Photoshop API NO posiciona ambos tipos igual:
+      - point:     visual = tx + xx * boundingBox.left
+                   El delta entre tx y bounds.left puede ser enorme y la
+                   API aun renderizar bien (la escala xx absorbe el offset).
+      - paragraph: visual = tx + 2 * boxBounds[0]
+                   Aqui boxBounds queda corrupto al hacer copy-paste entre
+                   artboards y la API planta el texto fuera del canvas.
+
+    Por defecto la GUI ignora capas point (no las marca como problema)
+    incluso si su delta es grande — son falsos positivos en la practica.
+    """
+    try:
+        ed = layer.engine_dict
+        children = ed['Rendered']['Shapes']['Children']
+        if not children:
+            return 'point'
+        st = children[0].get('ShapeType')
+        if st == 1:
+            return 'box'
+        return 'point'
+    except Exception:
+        return 'point'
+
+
 def _read_text_orientation_descriptor(layer):
     """Lee el campo `Ornt` (orientation) del descriptor TyShO de la capa.
 
@@ -234,7 +265,8 @@ def analyze_smart_objects(smart_objects):
 
 
 def check_type_layer(layer, threshold_px=THRESHOLD_PX,
-                     doc_width=None, doc_height=None):
+                     doc_width=None, doc_height=None,
+                     ignore_point_text=True):
     """Verifica un TypeLayer y devuelve un dict con su estado.
 
     Compara bounds visuales contra el transform interno con dos reglas
@@ -362,6 +394,16 @@ def check_type_layer(layer, threshold_px=THRESHOLD_PX,
         except:
             pass
 
+        # Shape type (point vs paragraph). Point text se posiciona via
+        # tx + xx*boundingBox.left, asi que la escala absorbe el offset
+        # corrupto y la API de Photoshop sigue rindiendo bien. Por eso
+        # los marcamos como no-problema cuando ignore_point_text=True,
+        # aunque su delta sea enorme: son falsos positivos para la API.
+        shape_type = _read_shape_type(layer)
+        if ignore_point_text and shape_type == 'point':
+            is_problem = False
+            reasons = ['point-text-ignored'] if reasons else []
+
         return {
             'name': layer.name,
             'layer_id': layer_id,
@@ -377,6 +419,7 @@ def check_type_layer(layer, threshold_px=THRESHOLD_PX,
             'height': layer.height,
             'orientation': orientation,
             'is_rotated': is_rotated,
+            'shape_type': shape_type,
             'matrix': matrix,
             'transform': (tx, ty),
             'delta': (delta_x, delta_y),
@@ -400,6 +443,7 @@ def check_type_layer(layer, threshold_px=THRESHOLD_PX,
             'height': layer.height,
             'orientation': 'horizontal',
             'is_rotated': False,
+            'shape_type': _read_shape_type(layer),
             'matrix': (1, 0, 0, 1, 0, 0),
             'transform': None,
             'delta': None,
@@ -410,13 +454,24 @@ def check_type_layer(layer, threshold_px=THRESHOLD_PX,
 
 
 def analyze_psd(psd_path, threshold_px=THRESHOLD_PX,
-                progress_callback=None, skip_groups=True):
+                progress_callback=None, skip_groups=True,
+                ignore_point_text=True):
     """Analiza un archivo PSD y devuelve sus resultados.
 
     skip_groups: si es True (default), ignora layers dentro de Groups
                  normales (no Artboards). Util cuando los grupos contienen
                  assets compartidos entre plataformas (logos, legales fijos)
                  que el equipo no piensa modificar via API.
+
+    ignore_point_text: si es True (default), las capas point con delta
+                       grande NO se marcan como problema. La Photoshop API
+                       las renderiza bien aunque el detector "vea"
+                       desincronizacion, porque PS las posiciona via
+                       tx + xx*boundingBox.left y la escala xx absorbe el
+                       offset corrupto. Solo paragraph text rompe la API.
+                       Desactivar este flag muestra TODOS los problemas
+                       de herencia (util para auditar habitos del equipo
+                       aunque no impacten la API).
 
     Retorna dict con:
         - path:     ruta de entrada
@@ -441,6 +496,7 @@ def analyze_psd(psd_path, threshold_px=THRESHOLD_PX,
             'path': psd_path,
             'width': 0, 'height': 0,
             'skip_groups': skip_groups,
+            'ignore_point_text': ignore_point_text,
             'layers': [], 'problems': [], 'total': 0,
             'smart_object_groups': [],
             'shared_smart_objects': [],
@@ -474,7 +530,8 @@ def analyze_psd(psd_path, threshold_px=THRESHOLD_PX,
         for i, tl in enumerate(type_layers):
             layers_results.append(
                 check_type_layer(tl, threshold_px,
-                                 doc_width=doc_w, doc_height=doc_h)
+                                 doc_width=doc_w, doc_height=doc_h,
+                                 ignore_point_text=ignore_point_text)
             )
             if progress_callback:
                 pct = 35.0 + (50.0 * (i + 1) / total)

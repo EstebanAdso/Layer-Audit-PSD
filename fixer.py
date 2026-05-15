@@ -1,77 +1,143 @@
+"""
+fixer.py
+========
+Repara text layers desincronizados reescribiendo el PSD via ag-psd
+(Node.js + agpsd/test11_boxbounds.js). Genera siempre una copia con
+sufijo `_fixed.psd` al lado del archivo original — el PSD de entrada
+nunca se modifica.
+
+Reemplaza el antiguo flujo basado en Photoshop + JSX. Requiere Node.js
+instalado en PATH y el directorio `agpsd/` con sus node_modules.
+"""
+
 import json
 import os
 import platform
 import subprocess
+import sys
 import tempfile
 
-def run_photoshop_script(jsx_path, psd_path):
-    """Ejecuta un script JSX en Photoshop de forma multiplataforma y no bloqueante."""
-    sys_name = platform.system()
-    try:
-        if sys_name == 'Windows':
-            safe_jsx_path = jsx_path.replace("\\", "\\\\")
-            safe_psd_path = psd_path.replace("\\", "\\\\")
-            
-            # VBScript que abre el PSD, espera un poco y luego lanza el script
-            vbs_content = (
-                'On Error Resume Next\n'
-                'Set app = CreateObject("Photoshop.Application")\n'
-                f'app.Open("{safe_psd_path}")\n'
-                'WScript.Sleep 2000\n' # Esperar 2 seg para asegurar que abre
-                f'app.DoJavaScriptFile("{safe_jsx_path}")\n'
-                'Set app = Nothing'
-            )
-            vbs_path = os.path.join(tempfile.gettempdir(), "launch_ps.vbs")
-            
-            with open(vbs_path, 'w', encoding='utf-16') as f:
-                f.write(vbs_content)
-            
-            subprocess.Popen(['cscript', '//Nologo', vbs_path], 
-                            creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0)
-            return True
-        elif sys_name == 'Darwin': # macOS
-            # En Mac usamos open -a que es inteligente
-            subprocess.Popen(['open', '-a', 'Adobe Photoshop', psd_path])
-            # Esperar un poco antes de lanzar el script
-            import time
-            time.sleep(2)
-            subprocess.Popen(['open', '-a', 'Adobe Photoshop', jsx_path])
-            return True
-        return False
-    except Exception as e:
-        print(f"Error crítico al lanzar script: {e}")
-        return False
 
-def fix_layers_in_psd(psd_path, layer_data):
-    """Prepara datos y lanza el proceso de corrección."""
-    if not layer_data:
-        return False
+def _find_agpsd_dir():
+    """Localiza el directorio `agpsd/` (con test11_boxbounds.js + node_modules).
 
-    temp_dir = tempfile.gettempdir()
-    json_path = os.path.join(temp_dir, "psd_layers_to_fix.json")
-    done_path = os.path.join(temp_dir, "psd_fix_done.txt")
-    log_path = os.path.join(temp_dir, "psd_fix_log.txt")
-    
-    try:
-        for stale_path in (done_path, log_path):
-            if os.path.exists(stale_path):
-                os.remove(stale_path)
-        with open(json_path, 'w', encoding='utf-8') as f:
-            json.dump(layer_data, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print(f"Error al escribir JSON: {e}")
-        return False
-
-    import sys
+    En desarrollo es un sibling de este script; bajo PyInstaller esta
+    en sys._MEIPASS.
+    """
     if hasattr(sys, '_MEIPASS'):
         base_dir = sys._MEIPASS
     else:
         base_dir = os.path.dirname(os.path.abspath(__file__))
-        
-    jsx_path = os.path.join(base_dir, "fixer.jsx")
-    
-    if not os.path.exists(jsx_path):
-        print(f"No existe fixer.jsx en {jsx_path}")
+    return os.path.join(base_dir, 'agpsd')
+
+
+def _build_manifest(layer_data):
+    """Convierte la lista interna de problem layers al formato que
+    espera test11_boxbounds.js: [{name, left, top, right, bottom}, ...].
+    """
+    manifest = []
+    for entry in layer_data:
+        left = entry.get('left')
+        top = entry.get('top')
+        if left is None or top is None:
+            continue
+        right = entry.get('right')
+        bottom = entry.get('bottom')
+        if right is None:
+            right = left + entry.get('width', 0)
+        if bottom is None:
+            bottom = top + entry.get('height', 0)
+        manifest.append({
+            'name': entry['name'],
+            'left': int(round(left)),
+            'top': int(round(top)),
+            'right': int(round(right)),
+            'bottom': int(round(bottom)),
+        })
+    return manifest
+
+
+def fixed_path_for(psd_path):
+    """Ruta de salida convencional: `<basename>_fixed<ext>` junto al original."""
+    base, ext = os.path.splitext(psd_path)
+    return f"{base}_fixed{ext}"
+
+
+def fix_layers_in_psd(psd_path, layer_data):
+    """Repara las capas indicadas y escribe `<base>_fixed.psd` al lado.
+
+    Retorna True si la reparacion termino OK y el archivo de salida existe.
+    El log/stderr de Node se vuelca a `psd_fix_log.txt` en temp.
+    """
+    if not layer_data:
         return False
 
-    return run_photoshop_script(jsx_path, psd_path)
+    manifest = _build_manifest(layer_data)
+    if not manifest:
+        return False
+
+    agpsd_dir = _find_agpsd_dir()
+    jsx_path = os.path.join(agpsd_dir, 'test11_boxbounds.js')
+    if not os.path.exists(jsx_path):
+        print(f"No existe test11_boxbounds.js en {jsx_path}")
+        return False
+
+    temp_dir = tempfile.gettempdir()
+    manifest_path = os.path.join(temp_dir, 'psd_layers_to_fix.json')
+    log_path = os.path.join(temp_dir, 'psd_fix_log.txt')
+
+    # Node corre con cwd=agpsd_dir; pasamos paths absolutos para que
+    # path.resolve() en test11_boxbounds.js no los relativice al cwd.
+    psd_path_abs = os.path.abspath(psd_path)
+    output_path = fixed_path_for(psd_path_abs)
+    manifest_path_abs = os.path.abspath(manifest_path)
+
+    try:
+        with open(manifest_path_abs, 'w', encoding='utf-8') as f:
+            json.dump(manifest, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"Error al escribir manifest: {e}")
+        return False
+
+    kwargs = {
+        'cwd': agpsd_dir,
+        'capture_output': True,
+        'text': True,
+        'encoding': 'utf-8',
+        'errors': 'replace',
+        # Sin timeout duro: PSDs muy grandes pueden tardar minutos.
+        'timeout': 600,
+    }
+    if platform.system() == 'Windows' and hasattr(subprocess, 'CREATE_NO_WINDOW'):
+        kwargs['creationflags'] = subprocess.CREATE_NO_WINDOW
+
+    try:
+        res = subprocess.run(
+            ['node', 'test11_boxbounds.js',
+             psd_path_abs, manifest_path_abs, output_path],
+            **kwargs,
+        )
+    except FileNotFoundError:
+        print("Node.js no esta instalado o no esta en PATH.")
+        return False
+    except subprocess.TimeoutExpired:
+        print("La reparacion excedio el timeout de 10 minutos.")
+        return False
+    except Exception as e:
+        print(f"Error lanzando Node: {e}")
+        return False
+
+    try:
+        with open(log_path, 'w', encoding='utf-8') as f:
+            f.write(f"$ node test11_boxbounds.js \"{psd_path}\" \"{manifest_path}\" \"{output_path}\"\n")
+            f.write(f"exit code: {res.returncode}\n\n")
+            f.write("--- stdout ---\n")
+            f.write(res.stdout or '')
+            f.write("\n--- stderr ---\n")
+            f.write(res.stderr or '')
+    except Exception:
+        pass
+
+    if res.returncode != 0:
+        return False
+    return os.path.exists(output_path)
