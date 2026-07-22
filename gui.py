@@ -20,6 +20,7 @@ Ejecutar:
 import multiprocessing
 import os
 import platform
+import sys
 import threading
 import tkinter as tk
 from tkinter import messagebox
@@ -32,26 +33,42 @@ from fixer import fix_layers_in_psd
 from utils import reveal_in_file_manager, check_node_available
 
 APP_TITLE = "Layer Audit PSD"
-APP_VERSION = "1.6.0"
+APP_VERSION = "2.0.0"
 
-# Paleta unificada (clam permite colores custom en Win/Mac/Linux)
-BG          = "#f1f3f9"
-SURFACE     = "#ffffff"
-SURFACE_ALT = "#f8fafc"
-BORDER      = "#e2e8f0"
-TEXT        = "#0f172a"
-TEXT_MUTED  = "#64748b"
-PRIMARY     = "#4f46e5"
-PRIMARY_HOV = "#4338ca"
-PRIMARY_DIM = "#a5b4fc"
-OK          = "#16a34a"
-OK_BG       = "#dcfce7"
-ERR         = "#dc2626"
-ERR_BG      = "#fee2e2"
-WARN        = "#d97706"
-WARN_BG     = "#fef3c7"
-SELECTED_BG = "#eef2ff"
-HOVER_BG    = "#f8fafc"
+
+def _asset_path(name):
+    """Ruta a un archivo de assets/, funcione en dev o empaquetado (_MEIPASS)."""
+    if hasattr(sys, '_MEIPASS'):
+        base = sys._MEIPASS
+    else:
+        base = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, 'assets', name)
+
+# Paleta oscura "morado casi negro" (tema v2). clam permite colores custom
+# en Win/Mac/Linux. La estructura la da la tipografia y el espaciado; el
+# color es acento (violeta), no andamiaje.
+BG          = "#120b1e"   # morado casi negro — fondo de pagina (fuera de cards)
+SURFACE     = "#1b1330"   # card / panel (morado elevado)
+SURFACE_ALT = "#241a3d"   # superficie secundaria (barra de filtros, badges, footer)
+BORDER      = "#342a4d"   # separadores 1px e indicadores inactivos
+TEXT        = "#ece9f7"   # texto primario (casi blanco con tinte lila)
+TEXT_MUTED  = "#9a90b8"   # texto secundario, captions, placeholders
+PRIMARY     = "#8b5cf6"   # violeta — acciones primarias, acentos, foco
+PRIMARY_HOV = "#a78bfa"   # violeta hover (mas claro)
+PRIMARY_DIM = "#4c3a7a"   # violeta bajo enfasis (estado en cola)
+OK          = "#34d399"   # verde — estado OK/exito
+OK_BG       = "#123227"   # verde fondo pill (oscuro)
+ERR         = "#fb7185"   # rojo/rosa — error/problema
+ERR_BG      = "#3a1622"   # rojo fondo pill (oscuro)
+WARN        = "#fbbf24"   # ambar — operaciones destructivas en curso (Reparando)
+WARN_BG     = "#3a2c10"   # ambar fondo pill (oscuro)
+SELECTED_BG = "#2a2148"   # fondo de fila seleccionada (tinte violeta)
+HOVER_BG    = "#221936"   # fondo de fila en hover
+
+# Grises-violeta para el scrollbar (thumb sobre track oscuro).
+SCROLL_THUMB     = "#3f3560"
+SCROLL_THUMB_HOV = "#4c3a7a"
+SCROLL_THUMB_ACT = "#5b4a8a"
 
 # --- Typography scale ------------------------------------------------------
 # Pick the closest role instead of declaring a new ('Segoe UI', N) tuple.
@@ -332,10 +349,11 @@ class FileRow(tk.Frame):
 
         text_problems = len(result.get('problems', []))
         shared_so = len(result.get('shared_smart_objects', []))
+        dup_names = len(result.get('duplicate_name_groups', []))
         total_layers = result.get('total', 0)
         total_so = result.get('smart_object_total', 0)
 
-        if text_problems == 0 and shared_so == 0:
+        if text_problems == 0 and shared_so == 0 and dup_names == 0:
             if total_layers == 0 and total_so == 0:
                 self.indicator.config(bg=BORDER)
                 self._set_pill("Vacio", TEXT_MUTED, SURFACE_ALT)
@@ -360,6 +378,11 @@ class FileRow(tk.Frame):
             parts.append(
                 "1 SO compartido" if shared_so == 1
                 else f"{shared_so} SO compartidos"
+            )
+        if dup_names:
+            parts.append(
+                "1 nombre dup." if dup_names == 1
+                else f"{dup_names} nombres dup."
             )
         self._set_detail(" + ".join(parts), ERR)
 
@@ -641,6 +664,7 @@ class DetailsPanel(tk.Frame):
             "  delta exacta entre bounds visuales y transform interno",
             "  shape type (point vs paragraph) y orientacion",
             "  smart objects compartidos que requieren accion manual",
+            "  nombres de capa duplicados dentro de un mismo artboard",
         ):
             self.text.insert('end', f"• {line.strip()}\n", 'bullet_muted')
         self.text.config(state='disabled')
@@ -697,17 +721,18 @@ class DetailsPanel(tk.Frame):
         else:
             text_p = len(result.get('problems', []))
             shared_so = len(result.get('shared_smart_objects', []))
+            dup_names = len(result.get('duplicate_name_groups', []))
             total_layers = result.get('total', 0)
             total_so = result.get('smart_object_total', 0)
 
-            if text_p == 0 and shared_so == 0:
+            if text_p == 0 and shared_so == 0 and dup_names == 0:
                 if total_layers == 0 and total_so == 0:
                     self._set_badge("Sin layers analizables",
                                     TEXT_MUTED, SURFACE_ALT)
                 else:
                     self._set_badge("Todo sincronizado", OK, OK_BG)
             else:
-                total_problems = text_p + shared_so
+                total_problems = text_p + shared_so + dup_names
                 label = ("1 problema" if total_problems == 1
                          else f"{total_problems} problemas")
                 self._set_badge(label, ERR, ERR_BG)
@@ -735,12 +760,14 @@ class DetailsPanel(tk.Frame):
 
         text_p = result.get('problems', [])
         shared_so = result.get('shared_smart_objects', [])
+        dup_groups = result.get('duplicate_name_groups', [])
 
         self.text.insert('end',
             f"\n  Documento: {result['width']}x{result['height']}px"
             f"   |   Text layers: {result['total']} ({len(text_p)} con problemas)"
             f"   |   Smart objects: {result.get('smart_object_total', 0)} "
-            f"({len(shared_so)} compartidos)\n",
+            f"({len(shared_so)} compartidos)"
+            f"   |   Nombres duplicados: {len(dup_groups)}\n",
             'muted')
 
         # ---- Text layers desincronizados ---------------------------------
@@ -815,11 +842,40 @@ class DetailsPanel(tk.Frame):
                 'hint_box')
             self.text.insert('end', "\n", 'muted')
 
-        if not text_p and not shared_so and (
+        # ---- Nombres de capa duplicados ----------------------------------
+        if dup_groups:
+            self.text.insert('end',
+                "\n  NOMBRES DE CAPA DUPLICADOS\n", 'h')
+            self.text.insert('end',
+                "  Estas capas comparten nombre dentro del mismo artboard. La "
+                "automatizacion (y el motor de reparacion) buscan las capas "
+                "por nombre y toman la PRIMERA coincidencia, asi que un nombre "
+                "repetido hace que se reemplace texto/imagen en la capa "
+                "equivocada.\n", 'muted')
+            for g in dup_groups:
+                self.text.insert('end',
+                    f"\n  ✗  '{g['name']}'  ×{g['count']}   "
+                    f"(artboard: {g['scope_name']})\n", 'err')
+                for L in g['layers']:
+                    bl, bt, br, bb = L['bounds']
+                    kind = 'texto' if L['kind'] == 'text' else 'smart object'
+                    self.text.insert('end',
+                        f"      • {kind:<12} bounds=({bl}, {bt}) → "
+                        f"({br}, {bb})\n", 'mono')
+
+            self.text.insert('end', "\n", 'muted')
+            self.text.insert('end',
+                "Solucion: en Photoshop, renombrar cada capa para que su "
+                "nombre sea unico dentro del artboard. La automatizacion "
+                "necesita nombres distintos para identificar cada capa sin "
+                "ambiguedad.\n", 'hint_box')
+            self.text.insert('end', "\n", 'muted')
+
+        if not text_p and not shared_so and not dup_groups and (
                 result['total'] > 0 or result.get('smart_object_total', 0) > 0):
             self.text.insert('end',
-                "\n  ✓ Todo sincronizado. Text layers OK y smart objects "
-                "todos independientes.\n", 'ok')
+                "\n  ✓ Todo sincronizado. Text layers OK, smart objects "
+                "independientes y nombres unicos.\n", 'ok')
 
         # ---- Listado completo de text layers -----------------------------
         if result['total'] > 0:
@@ -879,6 +935,10 @@ class App(tk.Tk):
         self.minsize(1100, 620)
         self.configure(bg=BG)
 
+        self._logo_img = None          # ref viva del logo del header
+        self._apply_window_icon()
+        self._enable_dark_titlebar()
+
         self._setup_style()
 
         self.rows = []
@@ -894,11 +954,56 @@ class App(tk.Tk):
         # (logos, legales fijos) que el equipo no piensa modificar via API.
         self.skip_groups_var = tk.BooleanVar(value=True)
         self.ignore_point_var = tk.BooleanVar(value=True)
+        # Detecta capas (texto + smart objects) con nombres repetidos dentro
+        # del mismo artboard. Activo por defecto: la automatizacion busca las
+        # capas por nombre y toma la primera coincidencia, asi que nombres
+        # duplicados hacen que se edite la capa equivocada.
+        self.check_dupes_var = tk.BooleanVar(value=True)
 
         self._build_ui()
         self._bind_mousewheel()
         self.protocol('WM_DELETE_WINDOW', self._on_close)
         self.after(50, self._poll_queue)
+
+    def _apply_window_icon(self):
+        """Asigna el icono de la ventana. En Windows usa el .ico (soporta
+        multi-size en la barra de tareas); en el resto cae a iconphoto PNG."""
+        ico = _asset_path('icon.ico')
+        png = _asset_path('icon.png')
+        try:
+            if platform.system() == 'Windows' and os.path.exists(ico):
+                self.iconbitmap(ico)
+                return
+        except tk.TclError:
+            pass
+        try:
+            if os.path.exists(png):
+                self._win_icon = tk.PhotoImage(file=png)
+                self.iconphoto(True, self._win_icon)
+        except Exception:
+            pass
+
+    def _enable_dark_titlebar(self):
+        """Pinta la barra de titulo de Windows en oscuro (DWM immersive dark
+        mode). Silencioso en plataformas o versiones que no lo soportan —
+        el resto de la UI ya es oscura, esto solo completa el look."""
+        if platform.system() != 'Windows':
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+            self.update_idletasks()
+            hwnd = ctypes.windll.user32.GetParent(self.winfo_id())
+            value = ctypes.c_int(1)
+            # 20 = DWMWA_USE_IMMERSIVE_DARK_MODE (Win10 2004+/Win11);
+            # 19 en builds mas viejos. Intentamos ambos.
+            for attr in (20, 19):
+                ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                    wintypes.HWND(hwnd), ctypes.c_int(attr),
+                    ctypes.byref(value), ctypes.sizeof(value)
+                )
+        except Exception:
+            pass
 
     def _setup_style(self):
         style = ttk.Style(self)
@@ -941,27 +1046,27 @@ class App(tk.Tk):
                             lightcolor=color, darkcolor=color,
                             thickness=4)
 
-        # Scrollbar visible: thumb gris medio sobre track claro, hover mas oscuro.
+        # Scrollbar: thumb violeta-gris sobre track oscuro, hover mas claro.
         style.configure('Vertical.TScrollbar',
-                        background='#cbd5e1',     # thumb (gris medio)
-                        troughcolor=SURFACE_ALT,  # track claro
-                        bordercolor=BORDER,
+                        background=SCROLL_THUMB,   # thumb
+                        troughcolor=SURFACE_ALT,   # track
+                        bordercolor=SURFACE_ALT,
                         arrowcolor=TEXT_MUTED,
-                        lightcolor='#cbd5e1',
-                        darkcolor='#cbd5e1',
+                        lightcolor=SCROLL_THUMB,
+                        darkcolor=SCROLL_THUMB,
                         gripcount=0,
                         relief='flat')
         style.map('Vertical.TScrollbar',
-                  background=[('active', '#94a3b8'),
-                              ('pressed', '#64748b')])
+                  background=[('active', SCROLL_THUMB_HOV),
+                              ('pressed', SCROLL_THUMB_ACT)])
         style.configure('Horizontal.TScrollbar',
-                        background='#cbd5e1', troughcolor=SURFACE_ALT,
-                        bordercolor=BORDER, arrowcolor=TEXT_MUTED,
-                        lightcolor='#cbd5e1', darkcolor='#cbd5e1',
+                        background=SCROLL_THUMB, troughcolor=SURFACE_ALT,
+                        bordercolor=SURFACE_ALT, arrowcolor=TEXT_MUTED,
+                        lightcolor=SCROLL_THUMB, darkcolor=SCROLL_THUMB,
                         gripcount=0, relief='flat')
         style.map('Horizontal.TScrollbar',
-                  background=[('active', '#94a3b8'),
-                              ('pressed', '#64748b')])
+                  background=[('active', SCROLL_THUMB_HOV),
+                              ('pressed', SCROLL_THUMB_ACT)])
 
         style.configure('TFrame', background=BG)
 
@@ -969,12 +1074,28 @@ class App(tk.Tk):
         header = tk.Frame(self, bg=BG)
         header.pack(fill='x', padx=20, pady=(16, 8))
 
-        tk.Label(header, text=APP_TITLE, bg=BG, fg=TEXT,
+        # Marca: logo + (titulo / subtitulo) en columna.
+        brand = tk.Frame(header, bg=BG)
+        brand.pack(anchor='w', fill='x')
+
+        logo_path = _asset_path('logo_header.png')
+        if os.path.exists(logo_path):
+            try:
+                self._logo_img = tk.PhotoImage(file=logo_path)
+                tk.Label(brand, image=self._logo_img, bg=BG).pack(
+                    side='left', padx=(0, SPACE_MD))
+            except Exception:
+                self._logo_img = None
+
+        brand_text = tk.Frame(brand, bg=BG)
+        brand_text.pack(side='left', fill='x', expand=True)
+
+        tk.Label(brand_text, text=APP_TITLE, bg=BG, fg=TEXT,
                  font=('Segoe UI', 15, 'bold')).pack(anchor='w')
         self.header_subtitle = tk.Label(
-            header,
-            text=("Detecta text layers desincronizados y smart objects "
-                  "compartidos en archivos PSD."),
+            brand_text,
+            text=("Detecta text layers desincronizados, smart objects "
+                  "compartidos y nombres de capa duplicados en archivos PSD."),
             bg=BG, fg=TEXT_MUTED, font=('Segoe UI', 9),
             wraplength=1200, justify='left'
         )
@@ -1033,9 +1154,18 @@ class App(tk.Tk):
         cb_style = ttk.Style()
         cb_style.configure('Filter.TCheckbutton',
                            background=SURFACE_ALT,
-                           foreground=TEXT)
+                           foreground=TEXT,
+                           indicatorbackground=SURFACE,
+                           indicatorforeground='#ffffff',
+                           bordercolor=BORDER,
+                           focuscolor=SURFACE_ALT,
+                           padding=(2, 2))
         cb_style.map('Filter.TCheckbutton',
-                     background=[('active', SURFACE_ALT)])
+                     background=[('active', SURFACE_ALT)],
+                     foreground=[('active', TEXT)],
+                     indicatorbackground=[('selected', PRIMARY),
+                                          ('active', SURFACE)],
+                     indicatorforeground=[('selected', '#ffffff')])
 
         # Ignora capas dentro de Groups normales (no Artboards). Los Groups
         # suelen tener assets fijos del equipo (logos, legales) que no
@@ -1057,6 +1187,17 @@ class App(tk.Tk):
             style='Filter.TCheckbutton',
         )
         self.ignore_point_cb.pack(side='left', padx=(16, 0))
+
+        # Reporta capas con nombres repetidos dentro del mismo artboard. La
+        # automatizacion referencia las capas por nombre (primera
+        # coincidencia), asi que nombres duplicados provocan que se reemplace
+        # texto/imagen en la capa equivocada.
+        self.check_dupes_cb = ttk.Checkbutton(
+            filters_inner, text="Nombres duplicados",
+            variable=self.check_dupes_var,
+            style='Filter.TCheckbutton',
+        )
+        self.check_dupes_cb.pack(side='left', padx=(16, 0))
 
         tk.Frame(left, bg=BORDER, height=1).pack(fill='x')
 
@@ -1185,6 +1326,10 @@ class App(tk.Tk):
             ("smart object compartido",
              "Dos o mas capas que apuntan al mismo asset embebido. "
              "Editar una afecta todas."),
+            ("nombres duplicados",
+             "Dos o mas capas con el mismo nombre dentro de un artboard. "
+             "La automatizacion busca por nombre y toma la primera, asi "
+             "que edita la capa equivocada."),
         ]
         for term, desc in items:
             tk.Label(inner, text=term,
@@ -1428,10 +1573,12 @@ class App(tk.Tk):
             # del checkbox no afectan analisis ya en cola.
             skip_groups = bool(self.skip_groups_var.get())
             ignore_point = bool(self.ignore_point_var.get())
+            check_dupes = bool(self.check_dupes_var.get())
             future = executor.submit(
                 analyze_psd, row.filepath,
                 skip_groups=skip_groups,
                 ignore_point_text=ignore_point,
+                check_duplicate_names=check_dupes,
             )
             future.add_done_callback(
                 lambda f, r=row: self._on_future_done(r, f)
@@ -1522,11 +1669,16 @@ class App(tk.Tk):
             )
             return
 
+        def _has_problems(res):
+            return bool(res.get('problems')
+                        or res.get('shared_smart_objects')
+                        or res.get('duplicate_name_groups'))
+
         with_problems = [r for r in done
-                         if not r.result.get('error') and r.result['problems']]
+                         if not r.result.get('error') and _has_problems(r.result)]
         with_errors = [r for r in done if r.result.get('error')]
         ok = [r for r in done
-              if not r.result.get('error') and not r.result['problems']]
+              if not r.result.get('error') and not _has_problems(r.result)]
 
         parts = [
             f"Analizados: {len(done)}/{len(self.rows)}",

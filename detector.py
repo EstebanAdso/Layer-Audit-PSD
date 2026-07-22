@@ -209,6 +209,88 @@ def _read_text_orientation_descriptor(layer):
     return None
 
 
+def _nearest_artboard(layer):
+    """Devuelve (layer_id, name) del Artboard ancestro mas cercano.
+
+    Sube por la cadena de `parent` hasta topar con un Artboard. Si el
+    layer no esta dentro de ningun artboard (esta al nivel del documento),
+    devuelve (None, None) — su "artboard" es el documento raiz.
+    """
+    node = _safe_attr(layer, 'parent')
+    while node is not None:
+        if isinstance(node, Artboard):
+            return (_safe_attr(node, 'layer_id'), _safe_attr(node, 'name'))
+        node = _safe_attr(node, 'parent')
+    return (None, None)
+
+
+def _layer_bounds(layer):
+    try:
+        return (layer.left, layer.top, layer.right, layer.bottom)
+    except Exception:
+        return (0, 0, 0, 0)
+
+
+def analyze_duplicate_names(type_layers, smart_object_layers):
+    """Detecta capas (texto y/o smart object) con nombres repetidos dentro
+    de un MISMO artboard.
+
+    Por que importa: el motor de reparacion (test11_boxbounds.js) y en
+    general la automatizacion de Ravel referencian las capas por nombre, y
+    `findLayerByName` devuelve la PRIMERA coincidencia del arbol. Dos capas
+    con el mismo nombre dentro del mismo contenedor generan una ambiguedad:
+    la API puede reemplazar texto/imagen en la capa equivocada.
+
+    El ambito es por artboard: en plantillas multiplataforma el mismo
+    nombre ('headline', 'cta') se repite legitimamente entre artboards
+    (uno por plataforma). Solo es problema cuando se repite DENTRO del
+    mismo artboard. Texto y smart objects comparten el mismo espacio de
+    nombres (un texto 'logo' y un SO 'logo' cuentan como duplicado entre
+    si), porque la automatizacion no distingue el tipo al buscar por nombre.
+
+    Retorna lista de dicts:
+        {
+            'name':       str,
+            'count':      int,
+            'scope_name': str,   # nombre del artboard o '(documento)'
+            'layers':     [{'name': str, 'kind': 'text'|'smart_object',
+                            'bounds': (l, t, r, b)}, ...],
+            'is_problem': True,
+        }
+    Solo se incluyen grupos con count >= 2.
+    """
+    records = [(layer, 'text') for layer in type_layers]
+    records += [(layer, 'smart_object') for layer in smart_object_layers]
+
+    by_scope_name = defaultdict(list)
+    scope_display = {}
+    for layer, kind in records:
+        name = _safe_attr(layer, 'name') or '(sin nombre)'
+        ab_id, ab_name = _nearest_artboard(layer)
+        scope_key = ('ab', ab_id) if ab_id is not None else ('doc', None)
+        by_scope_name[(scope_key, name)].append({
+            'name': name,
+            'kind': kind,
+            'bounds': _layer_bounds(layer),
+        })
+        scope_display[scope_key] = ab_name or '(documento)'
+
+    groups = []
+    for (scope_key, name), items in by_scope_name.items():
+        if len(items) < 2:
+            continue
+        groups.append({
+            'name': name,
+            'count': len(items),
+            'scope_name': scope_display.get(scope_key, '(documento)'),
+            'layers': items,
+            'is_problem': True,
+        })
+    # Orden estable para una UI predecible: por artboard y luego por nombre.
+    groups.sort(key=lambda g: (g['scope_name'], g['name']))
+    return groups
+
+
 def analyze_smart_objects(smart_objects):
     """
     Identifica grupos de SmartObjectLayer que comparten el mismo
@@ -455,7 +537,7 @@ def check_type_layer(layer, threshold_px=THRESHOLD_PX,
 
 def analyze_psd(psd_path, threshold_px=THRESHOLD_PX,
                 progress_callback=None, skip_groups=True,
-                ignore_point_text=True):
+                ignore_point_text=True, check_duplicate_names=True):
     """Analiza un archivo PSD y devuelve sus resultados.
 
     skip_groups: si es True (default), ignora layers dentro de Groups
@@ -473,6 +555,12 @@ def analyze_psd(psd_path, threshold_px=THRESHOLD_PX,
                        de herencia (util para auditar habitos del equipo
                        aunque no impacten la API).
 
+    check_duplicate_names: si es True (default), reporta capas de texto y
+                       smart objects con nombres repetidos dentro del mismo
+                       artboard. La automatizacion referencia las capas por
+                       nombre (primera coincidencia), asi que nombres
+                       duplicados provocan que se edite la capa equivocada.
+
     Retorna dict con:
         - path:     ruta de entrada
         - width, height: dimensiones del documento
@@ -484,6 +572,8 @@ def analyze_psd(psd_path, threshold_px=THRESHOLD_PX,
                                   (todos los grupos, len>=1)
         - shared_smart_objects:   solo grupos compartidos (len>=2) — son problema
         - smart_object_total:     cantidad total de SmartObjectLayer encontrados
+        - duplicate_name_groups:  grupos de capas con nombre repetido dentro
+                                  del mismo artboard (len>=2) — son problema
         - error:    str con el error de carga, o None
     """
     if progress_callback:
@@ -501,6 +591,7 @@ def analyze_psd(psd_path, threshold_px=THRESHOLD_PX,
             'smart_object_groups': [],
             'shared_smart_objects': [],
             'smart_object_total': 0,
+            'duplicate_name_groups': [],
             'error': f"No se pudo abrir el PSD: {e}",
         }
 
@@ -544,6 +635,11 @@ def analyze_psd(psd_path, threshold_px=THRESHOLD_PX,
     so_groups = analyze_smart_objects(smart_object_layers)
     shared = [g for g in so_groups if g['is_problem']]
 
+    dup_name_groups = (
+        analyze_duplicate_names(type_layers, smart_object_layers)
+        if check_duplicate_names else []
+    )
+
     templates_by_parent = {}
     fallback_template = None
     for r in layers_results:
@@ -583,5 +679,6 @@ def analyze_psd(psd_path, threshold_px=THRESHOLD_PX,
         'smart_object_groups': so_groups,
         'shared_smart_objects': shared,
         'smart_object_total': len(smart_object_layers),
+        'duplicate_name_groups': dup_name_groups,
         'error': None,
     }

@@ -60,12 +60,14 @@ def main(psd_path, skip_groups=True):
     problemas = result['problems']
     so_total = result.get('smart_object_total', 0)
     shared_so = result.get('shared_smart_objects', [])
+    dup_names = result.get('duplicate_name_groups', [])
 
     print(f"\n{'=' * 60}")
     print(f"  RESUMEN")
     print(f"{'=' * 60}")
     print(f"  Text layers:             {total}  ({len(problemas)} con problemas)")
     print(f"  Smart objects:           {so_total}  ({len(shared_so)} grupos compartidos)")
+    print(f"  Nombres duplicados:      {len(dup_names)} grupo(s)")
 
     if problemas:
         print(f"\n  TEXT LAYERS QUE FALLARAN CON LA API:")
@@ -86,7 +88,19 @@ def main(psd_path, skip_groups=True):
               f"Objects -> New Smart Object via Copy en cada layer "
               f"compartido para hacer instancias independientes.")
 
-    if not problemas and not shared_so:
+    if dup_names:
+        print(f"\n  NOMBRES DE CAPA DUPLICADOS (mismo nombre en un artboard):")
+        for g in dup_names:
+            print(f"   -> '{g['name']}'  x{g['count']}  "
+                  f"[artboard: {g['scope_name']}]")
+            for L in g['layers']:
+                kind = 'texto' if L['kind'] == 'text' else 'smart object'
+                print(f"      - {kind}: {L['bounds']}")
+        print(f"\n  SOLUCION NOMBRES: en Photoshop, renombrar cada capa para "
+              f"que su nombre sea unico dentro del artboard. La automatizacion "
+              f"referencia las capas por nombre (primera coincidencia).")
+
+    if not problemas and not shared_so and not dup_names:
         print(f"\n  Todo sincronizado correctamente.")
 
     print(f"{'=' * 60}\n")
