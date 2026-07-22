@@ -17,16 +17,21 @@ Ejecutar:
     python gui.py
 """
 
+import base64
+import io
 import multiprocessing
 import os
 import platform
 import sys
 import threading
 import tkinter as tk
+import tkinter.font as tkfont
 from tkinter import messagebox
 from concurrent.futures import ProcessPoolExecutor
 from queue import Empty, Queue
 from tkinter import filedialog, ttk
+
+from PIL import Image, ImageDraw
 
 from detector import analyze_psd
 from fixer import fix_layers_in_psd
@@ -70,6 +75,10 @@ SCROLL_THUMB     = "#3f3560"
 SCROLL_THUMB_HOV = "#4c3a7a"
 SCROLL_THUMB_ACT = "#5b4a8a"
 
+# Degradado de los botones primarios (violeta → púrpura).
+GRAD_1 = (124, 92, 255)   # #7c5cff
+GRAD_2 = (168, 85, 247)   # #a855f7
+
 # --- Typography scale ------------------------------------------------------
 # Pick the closest role instead of declaring a new ('Segoe UI', N) tuple.
 FONT_TITLE     = ('Segoe UI', 13, 'bold')   # panel headings
@@ -107,6 +116,243 @@ def _truncate_path(path, max_len=64):
         return path
     keep = (max_len - 1) // 2
     return path[:keep] + '…' + path[-keep:]
+
+
+# ===========================================================================
+# ToggleCheck — checkbox custom
+# ===========================================================================
+
+def _make_checkbox_img(size, state, master=None):
+    """Renderiza la casilla como imagen anti-aliased (supersampling + LANCZOS).
+
+    state: 'on' (violeta con ✓ blanco), 'off' (borde), 'off_hover' (borde
+    violeta). El ✓ se dibuja como un trazo suave, no un carácter de fuente,
+    así que no se ve dentado como el glifo Unicode.
+    """
+    scale = 4
+    s = size * scale
+    img = Image.new('RGBA', (s, s), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    radius = int(s * 0.30)
+
+    if state == 'on':
+        d.rounded_rectangle([0, 0, s - 1, s - 1], radius=radius,
+                            fill=_rgb(PRIMARY))
+        lw = max(2, int(s * 0.11))
+        d.line([(s * 0.26, s * 0.52), (s * 0.43, s * 0.69),
+                (s * 0.75, s * 0.31)],
+               fill=(255, 255, 255, 255), width=lw, joint='curve')
+        # Redondear las puntas del trazo del check.
+        r = lw / 2
+        for (px, py) in ((s * 0.26, s * 0.52), (s * 0.43, s * 0.69),
+                         (s * 0.75, s * 0.31)):
+            d.ellipse([px - r, py - r, px + r, py + r], fill=(255, 255, 255, 255))
+    else:
+        border = _rgb(PRIMARY_DIM if state == 'off_hover' else BORDER)
+        bw = max(2, int(s * 0.09))
+        off = bw / 2
+        d.rounded_rectangle([off, off, s - 1 - off, s - 1 - off],
+                            radius=radius, outline=border, width=bw,
+                            fill=_rgb(SURFACE))
+
+    img = img.resize((size, size), Image.LANCZOS)
+    return _pil_to_photo(img, master=master)
+
+
+class ToggleCheck(tk.Frame):
+    """Checkbox legible en tema oscuro, con la casilla renderizada como
+    imagen anti-aliased (esquinas y ✓ suaves, sin el dentado del glifo
+    Unicode). Usa la misma `tk.BooleanVar`, así que el resto del código no
+    cambia.
+    """
+
+    _SIZE = 18
+
+    def __init__(self, parent, text, variable, bg):
+        super().__init__(parent, bg=bg, cursor='hand2')
+        self.var = variable
+        self._bg = bg
+
+        self._img_on = _make_checkbox_img(self._SIZE, 'on', master=self)
+        self._img_off = _make_checkbox_img(self._SIZE, 'off', master=self)
+        self._img_off_hover = _make_checkbox_img(self._SIZE, 'off_hover',
+                                                 master=self)
+
+        self.box = tk.Label(self, bg=bg, bd=0, highlightthickness=0)
+        self.box.pack(side='left')
+
+        self.lbl = tk.Label(self, text=text, bg=bg, fg=TEXT,
+                            font=('Segoe UI', 9), cursor='hand2')
+        self.lbl.pack(side='left', padx=(SPACE_SM, 0))
+
+        for w in (self, self.box, self.lbl):
+            w.bind('<Button-1>', self._toggle)
+            w.bind('<Enter>', self._hover_in)
+            w.bind('<Leave>', self._hover_out)
+
+        self._hovering = False
+        self._render()
+
+    def _toggle(self, _e=None):
+        self.var.set(not bool(self.var.get()))
+        self._render()
+        return 'break'
+
+    def _render(self):
+        if self.var.get():
+            self.box.config(image=self._img_on)
+        elif self._hovering:
+            self.box.config(image=self._img_off_hover)
+        else:
+            self.box.config(image=self._img_off)
+
+    def _hover_in(self, _e=None):
+        self._hovering = True
+        self.lbl.config(fg=PRIMARY_HOV)
+        self._render()
+
+    def _hover_out(self, _e=None):
+        self._hovering = False
+        self.lbl.config(fg=TEXT)
+        self._render()
+
+
+# ===========================================================================
+# Imágenes de assets (con caché por tamaño)
+# ===========================================================================
+
+_IMG_CACHE = {}
+
+
+def _rgb(hexstr):
+    """'#rrggbb' -> (r, g, b)."""
+    h = hexstr.lstrip('#')
+    return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def _pil_to_photo(img, master=None):
+    """Convierte una imagen PIL a tk.PhotoImage vía PNG en memoria.
+
+    Usamos tk.PhotoImage(data=PNG) en vez de ImageTk.PhotoImage porque
+    ImageTk falla de forma intermitente al componerse sobre un Canvas en
+    este entorno ("invalid command name"). tk.PhotoImage con datos PNG
+    (Tk 8.6+) es estable tanto en Label como en Canvas.
+    """
+    buf = io.BytesIO()
+    img.save(buf, 'PNG')
+    data = base64.b64encode(buf.getvalue())
+    return tk.PhotoImage(data=data, master=master)
+
+
+def load_asset_image(name, size=None):
+    """Carga assets/<name> y devuelve un tk.PhotoImage (cacheado).
+
+    size: (w, h) para redimensionar con LANCZOS, o None para el tamaño
+    original. Devuelve None si el archivo no existe. Mantener la referencia
+    viva (la caché lo hace) es imprescindible: Tk descarta las imágenes sin
+    referencias en Python.
+    """
+    key = (name, size)
+    if key in _IMG_CACHE:
+        return _IMG_CACHE[key]
+    path = _asset_path(name)
+    if not os.path.exists(path):
+        return None
+    try:
+        img = Image.open(path).convert('RGBA')
+        if size is not None:
+            img = img.resize(size, Image.LANCZOS)
+        photo = _pil_to_photo(img)
+        _IMG_CACHE[key] = photo
+        return photo
+    except Exception:
+        return None
+
+
+# ===========================================================================
+# GradientButton — botón primario con degradado y esquinas redondeadas
+# ===========================================================================
+
+class GradientButton(tk.Canvas):
+    """Botón con fondo de degradado violeta→púrpura y esquinas redondeadas.
+
+    Tkinter no dibuja degradados ni bordes redondeados en widgets nativos,
+    así que el fondo se renderiza como imagen (Pillow) y se compone sobre un
+    Canvas. El color de fondo del Canvas debe ser el del contenedor para que
+    las esquinas transparentes se integren.
+    """
+
+    def __init__(self, parent, text, command, bg,
+                 height=40, padx=24, radius=11,
+                 fg='#ffffff', font=('Segoe UI', 10, 'bold')):
+        self._font = tkfont.Font(family=font[0], size=font[1],
+                                 weight='bold')
+        width = self._font.measure(text) + padx * 2
+        super().__init__(parent, width=width, height=height, bg=bg,
+                         highlightthickness=0, bd=0, cursor='hand2',
+                         takefocus=0)
+        self._command = command
+        # OJO: no usar self._w / self._h — son el pathname interno del
+        # widget en tkinter. Usamos _bw / _bh (button width/height).
+        self._bw, self._bh, self._radius = width, height, radius
+        self._enabled = True
+
+        self._img_normal = self._render(1.0)
+        self._img_hover = self._render(1.14)
+        self._img_disabled = self._render(1.0, disabled=True)
+
+        self._bg_id = self.create_image(0, 0, anchor='nw',
+                                        image=self._img_normal)
+        self._txt_id = self.create_text(width // 2, height // 2 + 1,
+                                        text=text, fill=fg,
+                                        font=(font[0], font[1], 'bold'))
+        self.bind('<Button-1>', self._on_click)
+        self.bind('<Enter>', self._on_enter)
+        self.bind('<Leave>', self._on_leave)
+
+    def _render(self, bright, disabled=False):
+        scale = 2  # supersample para bordes nítidos
+        w, h = self._bw * scale, self._bh * scale
+        # Fila de degradado horizontal, luego se estira en alto.
+        row = Image.new('RGB', (w, 1))
+        px = row.load()
+        for x in range(w):
+            t = x / (w - 1)
+            r = GRAD_1[0] + (GRAD_2[0] - GRAD_1[0]) * t
+            g = GRAD_1[1] + (GRAD_2[1] - GRAD_1[1]) * t
+            b = GRAD_1[2] + (GRAD_2[2] - GRAD_1[2]) * t
+            if disabled:
+                r, g, b = r * 0.45 + 40, g * 0.45 + 35, b * 0.45 + 60
+            else:
+                r, g, b = r * bright, g * bright, b * bright
+            px[x, 0] = (min(255, int(r)), min(255, int(g)), min(255, int(b)))
+        grad = row.resize((w, h))
+        mask = Image.new('L', (w, h), 0)
+        ImageDraw.Draw(mask).rounded_rectangle(
+            [0, 0, w - 1, h - 1], radius=self._radius * scale, fill=255)
+        out = Image.new('RGBA', (w, h), (0, 0, 0, 0))
+        out.paste(grad, (0, 0), mask)
+        out = out.resize((self._bw, self._bh), Image.LANCZOS)
+        return _pil_to_photo(out, master=self)
+
+    def _on_click(self, _e=None):
+        if self._enabled and self._command:
+            self._command()
+        return 'break'
+
+    def _on_enter(self, _e=None):
+        if self._enabled:
+            self.itemconfig(self._bg_id, image=self._img_hover)
+
+    def _on_leave(self, _e=None):
+        if self._enabled:
+            self.itemconfig(self._bg_id, image=self._img_normal)
+
+    def set_enabled(self, enabled):
+        self._enabled = bool(enabled)
+        self.itemconfig(self._bg_id,
+                        image=self._img_normal if enabled else self._img_disabled)
+        self.config(cursor='hand2' if enabled else '')
 
 
 # ===========================================================================
@@ -458,11 +704,9 @@ class DetailsPanel(tk.Frame):
             command=self._handle_reveal_click
         )
 
-        self.fix_action_btn = ttk.Button(
-            title_row, text="Corregir capas",
-            style='Primary.TButton',
-            command=self._handle_fix_click
-        )
+        self.fix_action_btn = GradientButton(
+            title_row, "Corregir capas",
+            self._handle_fix_click, bg=SURFACE)
 
         self.subtitle_lbl = tk.Label(
             self.header,
@@ -486,18 +730,22 @@ class DetailsPanel(tk.Frame):
 
         tk.Frame(self, bg=BORDER, height=1).pack(fill='x')
 
-        body = tk.Frame(self, bg=SURFACE)
-        body.pack(fill='both', expand=True, padx=SPACE_XS, pady=SPACE_XS)
+        self._body = tk.Frame(self, bg=SURFACE)
+        self._body.pack(fill='both', expand=True, padx=SPACE_XS, pady=SPACE_XS)
 
         self.text = tk.Text(
-            body, wrap='word', bg=SURFACE, fg=TEXT, bd=0,
+            self._body, wrap='word', bg=SURFACE, fg=TEXT, bd=0,
             highlightthickness=0, padx=SPACE_LG + 2, pady=SPACE_MD,
             font=FONT_MONO, spacing1=2, spacing3=2, cursor='arrow'
         )
-        sb = ttk.Scrollbar(body, command=self.text.yview)
-        self.text.configure(yscrollcommand=sb.set)
+        self._sb = ttk.Scrollbar(self._body, command=self.text.yview)
+        self.text.configure(yscrollcommand=self._sb.set)
         self.text.pack(side='left', fill='both', expand=True)
-        sb.pack(side='right', fill='y')
+        self._sb.pack(side='right', fill='y')
+
+        # Overlay para los estados "hero" (vacío / pendiente / analizando):
+        # widgets reales centrados con ilustración, en vez del Text widget.
+        self.hero_frame = tk.Frame(self._body, bg=SURFACE)
 
         self._configure_tags()
         self.show_empty()
@@ -638,6 +886,52 @@ class DetailsPanel(tk.Frame):
         else:
             self.reveal_action_btn.pack_forget()
 
+    def _enter_hero_mode(self):
+        """Oculta el Text widget y muestra el overlay hero.
+
+        Determinista (no depende de winfo_ismapped, que es falso durante la
+        construcción): pack_forget es no-op si no está empacado.
+        """
+        self.text.pack_forget()
+        self._sb.pack_forget()
+        self.hero_frame.pack(fill='both', expand=True)
+
+    def _exit_hero_mode(self):
+        """Oculta el overlay hero y restaura el Text widget."""
+        self.hero_frame.pack_forget()
+        self.text.pack(side='left', fill='both', expand=True)
+        self._sb.pack(side='right', fill='y')
+
+    def _render_hero(self, title, caption, image='hero.png',
+                     bullets=None, dim_image=False):
+        """Dibuja un estado centrado con ilustración + título + caption
+        (+ checklist opcional) en el overlay hero."""
+        for w in self.hero_frame.winfo_children():
+            w.destroy()
+        inner = tk.Frame(self.hero_frame, bg=SURFACE)
+        inner.place(relx=0.5, rely=0.5, anchor='center')
+
+        img = load_asset_image(image, (168, 168)) if image else None
+        if img is not None:
+            tk.Label(inner, image=img, bg=SURFACE).pack()
+        tk.Label(inner, text=title, bg=SURFACE, fg=TEXT,
+                 font=('Segoe UI', 15, 'bold')).pack(pady=(SPACE_LG, SPACE_XS))
+        tk.Label(inner, text=caption, bg=SURFACE, fg=TEXT_MUTED,
+                 font=FONT_BODY, justify='center', wraplength=380).pack()
+
+        if bullets:
+            box = tk.Frame(inner, bg=SURFACE_ALT)
+            box.pack(pady=(SPACE_XL, 0), ipadx=SPACE_MD, ipady=SPACE_SM)
+            tk.Label(box, text="Después del análisis verás:",
+                     bg=SURFACE_ALT, fg=TEXT, font=FONT_CAPTION,
+                     anchor='w').pack(fill='x', padx=SPACE_MD,
+                                      pady=(SPACE_SM, SPACE_XS))
+            for b in bullets:
+                tk.Label(box, text=f"•  {b}", bg=SURFACE_ALT, fg=TEXT_MUTED,
+                         font=FONT_CAPTION, anchor='w',
+                         justify='left').pack(fill='x', padx=SPACE_MD)
+        self._enter_hero_mode()
+
     def show_empty(self):
         self.current_row = None
         self.title_lbl.config(text="Detalles")
@@ -647,27 +941,16 @@ class DetailsPanel(tk.Frame):
         self._set_badge("", TEXT_MUTED, SURFACE)
         self._show_reveal_btn(False)
         self._update_action_bar(None)
-
-        self.text.config(state='normal')
-        self.text.delete('1.0', 'end')
-        # Hero centrado: glyph + titulo + caption + checklist preview.
-        self.text.insert('end', "\n", 'muted')
-        self.text.insert('end', "□\n", 'hero_glyph')
-        self.text.insert('end', "Nada seleccionado\n", 'hero_title')
-        self.text.insert('end',
-            "Carga uno o mas PSD a la izquierda y pulsa Analizar Todo.\n\n",
-            'hero_caption')
-        self.text.insert('end',
-            "Despues del analisis veras aqui:\n", 'bullet_label')
-        for line in (
-            "  text layers con transform desincronizado",
-            "  delta exacta entre bounds visuales y transform interno",
-            "  shape type (point vs paragraph) y orientacion",
-            "  smart objects compartidos que requieren accion manual",
-            "  nombres de capa duplicados dentro de un mismo artboard",
-        ):
-            self.text.insert('end', f"• {line.strip()}\n", 'bullet_muted')
-        self.text.config(state='disabled')
+        self._render_hero(
+            "Nada seleccionado",
+            "Carga uno o más PSD a la izquierda y pulsa Analizar Todo.",
+            bullets=(
+                "text layers con transform desincronizado",
+                "delta entre bounds visuales y transform interno",
+                "shape type (point vs paragraph) y orientación",
+                "smart objects compartidos y nombres duplicados",
+            ),
+        )
 
     def show_pending(self, row):
         self.current_row = row
@@ -676,15 +959,10 @@ class DetailsPanel(tk.Frame):
         self._set_badge("Pendiente", TEXT_MUTED, SURFACE_ALT)
         self._show_reveal_btn(True)
         self._update_action_bar(row)
-        self.text.config(state='normal')
-        self.text.delete('1.0', 'end')
-        self.text.insert('end', "\n", 'muted')
-        self.text.insert('end', "○\n", 'hero_glyph')
-        self.text.insert('end', "Aun sin analizar\n", 'hero_title')
-        self.text.insert('end',
+        self._render_hero(
+            "Aún sin analizar",
             "Pulsa ▶ en la fila o Analizar Todo para procesar este archivo.",
-            'hero_caption')
-        self.text.config(state='disabled')
+        )
 
     def show_running(self, row):
         self.current_row = row
@@ -693,15 +971,10 @@ class DetailsPanel(tk.Frame):
         self._set_badge("Analizando", PRIMARY, SELECTED_BG)
         self._show_reveal_btn(True)
         self._update_action_bar(row)
-        self.text.config(state='normal')
-        self.text.delete('1.0', 'end')
-        self.text.insert('end', "\n", 'muted')
-        self.text.insert('end', "◎\n", 'hero_glyph')
-        self.text.insert('end', "Procesando\n", 'hero_title')
-        self.text.insert('end',
+        self._render_hero(
+            "Procesando…",
             "Para PSDs grandes esto puede tardar varios segundos.",
-            'hero_caption')
-        self.text.config(state='disabled')
+        )
 
     def show_result(self, row):
         self.current_row = row
@@ -709,6 +982,7 @@ class DetailsPanel(tk.Frame):
         self.title_lbl.config(text=row.filename)
         self.subtitle_lbl.config(text=_truncate_path(row.filepath, 90))
         self._show_reveal_btn(True)
+        self._exit_hero_mode()
 
         if result is None:
             self.show_pending(row)
@@ -1127,9 +1401,8 @@ class App(tk.Tk):
                                     command=self.clear_files)
         self.clear_btn.pack(side='left', padx=(6, 0))
 
-        self.analyze_btn = ttk.Button(actions_bar, text="Analizar Todo",
-                                      command=self.analyze_all,
-                                      style='Primary.TButton')
+        self.analyze_btn = GradientButton(actions_bar, "Analizar Todo",
+                                          self.analyze_all, bg=SURFACE)
         self.analyze_btn.pack(side='right')
 
         self.info_btn = ttk.Button(actions_bar, text="?",
@@ -1149,55 +1422,31 @@ class App(tk.Tk):
                  bg=SURFACE_ALT, fg=TEXT_MUTED,
                  font=('Segoe UI', 9)).pack(side='left', padx=(0, 8))
 
-        # Para usar el fondo SURFACE_ALT necesitamos un style propio: ttk
-        # Checkbutton no respeta `bg` en tk.Frame padres con fondo custom.
-        cb_style = ttk.Style()
-        cb_style.configure('Filter.TCheckbutton',
-                           background=SURFACE_ALT,
-                           foreground=TEXT,
-                           indicatorbackground=SURFACE,
-                           indicatorforeground='#ffffff',
-                           bordercolor=BORDER,
-                           focuscolor=SURFACE_ALT,
-                           padding=(2, 2))
-        cb_style.map('Filter.TCheckbutton',
-                     background=[('active', SURFACE_ALT)],
-                     foreground=[('active', TEXT)],
-                     indicatorbackground=[('selected', PRIMARY),
-                                          ('active', SURFACE)],
-                     indicatorforeground=[('selected', '#ffffff')])
-
         # Ignora capas dentro de Groups normales (no Artboards). Los Groups
         # suelen tener assets fijos del equipo (logos, legales) que no
         # entran en automatizaciones.
-        self.skip_groups_cb = ttk.Checkbutton(
-            filters_inner, text="Ignorar carpetas",
-            variable=self.skip_groups_var,
-            style='Filter.TCheckbutton',
-        )
+        self.skip_groups_cb = ToggleCheck(
+            filters_inner, "Ignorar carpetas",
+            self.skip_groups_var, SURFACE_ALT)
         self.skip_groups_cb.pack(side='left')
 
         # Ignora text layers de tipo point. La Photoshop API los posiciona
         # bien aun con herencia rota (visual = tx + xx*boundingBox.left),
         # asi que por default no los reportamos. Desactivar para auditar
         # habitos del equipo aun si no impactan la pipeline.
-        self.ignore_point_cb = ttk.Checkbutton(
-            filters_inner, text="Ignorar capas point",
-            variable=self.ignore_point_var,
-            style='Filter.TCheckbutton',
-        )
-        self.ignore_point_cb.pack(side='left', padx=(16, 0))
+        self.ignore_point_cb = ToggleCheck(
+            filters_inner, "Ignorar capas point",
+            self.ignore_point_var, SURFACE_ALT)
+        self.ignore_point_cb.pack(side='left', padx=(SPACE_XL, 0))
 
         # Reporta capas con nombres repetidos dentro del mismo artboard. La
         # automatizacion referencia las capas por nombre (primera
         # coincidencia), asi que nombres duplicados provocan que se reemplace
         # texto/imagen en la capa equivocada.
-        self.check_dupes_cb = ttk.Checkbutton(
-            filters_inner, text="Nombres duplicados",
-            variable=self.check_dupes_var,
-            style='Filter.TCheckbutton',
-        )
-        self.check_dupes_cb.pack(side='left', padx=(16, 0))
+        self.check_dupes_cb = ToggleCheck(
+            filters_inner, "Nombres duplicados",
+            self.check_dupes_var, SURFACE_ALT)
+        self.check_dupes_cb.pack(side='left', padx=(SPACE_XL, 0))
 
         tk.Frame(left, bg=BORDER, height=1).pack(fill='x')
 
@@ -1238,13 +1487,24 @@ class App(tk.Tk):
         self.canvas.pack(side='left', fill='both', expand=True)
         self.scrollbar.pack(side='right', fill='y')
 
-        self.empty_lbl = tk.Label(
-            self.list_frame,
-            text="No hay archivos cargados.\n\nUsa  + Agregar PSDs  para empezar.",
-            bg=SURFACE, fg=TEXT_MUTED, font=('Segoe UI', 10),
-            justify='center', pady=80
-        )
-        self.empty_lbl.pack(fill='both', expand=True)
+        self.empty_state = tk.Frame(self.list_frame, bg=SURFACE)
+        _es_inner = tk.Frame(self.empty_state, bg=SURFACE)
+        _es_inner.pack(expand=True, pady=(64, 40))
+
+        _hero_sm = load_asset_image('hero.png', (132, 132))
+        if _hero_sm is not None:
+            tk.Label(_es_inner, image=_hero_sm, bg=SURFACE).pack()
+        tk.Label(_es_inner, text="Arrastra o agrega tus PSD",
+                 bg=SURFACE, fg=TEXT, font=('Segoe UI', 14, 'bold')
+                 ).pack(pady=(SPACE_MD, SPACE_XS))
+        tk.Label(_es_inner,
+                 text="Carga uno o varios archivos .psd / .psb para auditar\n"
+                      "text layers, smart objects y nombres de capa.",
+                 bg=SURFACE, fg=TEXT_MUTED, font=FONT_BODY,
+                 justify='center').pack()
+        GradientButton(_es_inner, "+  Agregar PSDs", self.add_files,
+                       bg=SURFACE).pack(pady=(SPACE_XL, 0))
+        self.empty_state.pack(fill='both', expand=True)
 
         tk.Frame(left, bg=BORDER, height=1).pack(fill='x')
         footer = tk.Frame(left, bg=SURFACE_ALT)
@@ -1503,9 +1763,9 @@ class App(tk.Tk):
 
     def _refresh_empty_state(self):
         if self.rows:
-            self.empty_lbl.pack_forget()
+            self.empty_state.pack_forget()
         else:
-            self.empty_lbl.pack(fill='both', expand=True)
+            self.empty_state.pack(fill='both', expand=True)
 
     def _reveal_row(self, row):
         reveal_in_file_manager(row.filepath)
@@ -1637,7 +1897,7 @@ class App(tk.Tk):
         if not self.rows:
             self.summary_lbl.config(text="Carga uno o mas PSD para empezar.",
                                     fg=TEXT_MUTED)
-            self.analyze_btn.state(['!disabled'])
+            self.analyze_btn.set_enabled(True)
             return
 
         running = [r for r in self.rows if r.state == ST_RUNNING]
@@ -1646,11 +1906,11 @@ class App(tk.Tk):
         idle    = [r for r in self.rows if r.state == ST_IDLE]
 
         if idle or done:
-            self.analyze_btn.state(['!disabled'])
+            self.analyze_btn.set_enabled(True)
         elif running or queued:
-            self.analyze_btn.state(['disabled'])
+            self.analyze_btn.set_enabled(False)
         else:
-            self.analyze_btn.state(['!disabled'])
+            self.analyze_btn.set_enabled(True)
 
         if running or queued:
             parts = []

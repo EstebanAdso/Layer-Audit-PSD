@@ -99,11 +99,46 @@ def build_master():
     return base
 
 
+def build_hero():
+    """Ilustración para los estados vacíos: capas violeta flotando sobre un
+    glow radial, fondo transparente (se compone sobre el panel de la GUI)."""
+    from PIL import ImageFilter
+    H = 640
+    img = Image.new('RGBA', (H, H), (0, 0, 0, 0))
+
+    # Glow radial violeta (circulo relleno + blur fuerte).
+    glow = Image.new('RGBA', (H, H), (0, 0, 0, 0))
+    gd = ImageDraw.Draw(glow)
+    gd.ellipse([H * 0.16, H * 0.20, H * 0.84, H * 0.88],
+               fill=LAYER_MID + (120,))
+    glow = glow.filter(ImageFilter.GaussianBlur(H * 0.10))
+    img = Image.alpha_composite(img, glow)
+
+    draw = ImageDraw.Draw(img)
+    cx = H // 2
+    half_w = int(H * 0.28)
+    half_h = int(H * 0.155)
+    gap = int(H * 0.125)
+    ow = int(H * 0.010)
+    for cy, color in [(cx + gap, LAYER_LO),
+                      (cx,       LAYER_MID),
+                      (cx - gap, LAYER_HI)]:
+        draw.polygon(rhombus(cx, cy, half_w, half_h),
+                     fill=color, outline=OUTLINE, width=ow)
+
+    hero = img.resize((240, 240), Image.LANCZOS)
+    path = os.path.join(HERE, 'hero.png')
+    hero.save(path)
+    print('escrito', path)
+
+
 def main():
     master = build_master()
     png_path = os.path.join(HERE, 'icon.png')
     master.save(png_path)
     print('escrito', png_path)
+
+    build_hero()
 
     # Header pequeno (48px) para la GUI.
     header = master.resize((48, 48), Image.LANCZOS)

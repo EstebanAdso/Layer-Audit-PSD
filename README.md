@@ -1,189 +1,274 @@
 # Layer Audit PSD
 
-Herramienta de auditoría y reparación de archivos Photoshop (`.psd` / `.psb`) que sufren **herencia de transform corrupto** cuando el equipo de diseño copia/pega capas de texto entre artboards. Su objetivo es que esos PSDs sean utilizables por automatizaciones que reemplazan texto e imágenes vía la Photoshop API (o equivalentes), sin que el contenido sustituido termine en la posición equivocada o fuera del canvas.
+**Detecta y repara problemas estructurales en archivos `.psd` / `.psb` que rompen la automatización de Photoshop** cuando los diseñadores entregan plantillas para reemplazo automático de texto e imágenes.
+
+No requiere Photoshop para detectar ni para reparar.
+
+![Layer Audit PSD](image.png)
 
 ---
 
-## El problema que resuelve
+## Índice
 
-Cuando un diseñador hace **Ctrl+C / Ctrl+V** de una capa de texto entre dos artboards en el mismo PSD, Photoshop actualiza los `bounds` visuales de la copia pero **deja el transform interno (`tx`, `ty`) apuntando al artboard original**. Visualmente la capa se ve donde corresponde, pero al reemplazar su texto programáticamente (`textItem.contents = "..."`), Photoshop reposiciona el contenido usando los anchors internos corruptos y el texto aparece a miles de píxeles del lugar correcto.
-
-Lo mismo pasa con **Smart Objects**: un Ctrl+V duplica el layer pero ambos apuntan al mismo asset embebido (mismo `unique_id`), así que editar uno modifica todos.
-
-Ambos problemas son invisibles para el diseñador, salen a la luz solo cuando la pipeline de automatización corre y empieza a producir piezas rotas. Este proyecto los detecta y repara antes de que lleguen a producción.
+- [El problema](#el-problema)
+- [Qué detecta (3 auditorías)](#qué-detecta-3-auditorías)
+- [Cómo funciona por dentro](#cómo-funciona-por-dentro)
+- [Cómo decide cada cosa (la lógica de detección)](#cómo-decide-cada-cosa-la-lógica-de-detección)
+- [El manifest y la reparación](#el-manifest-y-la-reparación)
+- [Instalación](#instalación)
+- [Uso](#uso)
+- [Compilar el ejecutable](#compilar-el-ejecutable)
+- [Estructura del proyecto](#estructura-del-proyecto)
+- [Requisitos](#requisitos)
+- [Notas y límites conocidos](#notas-y-límites-conocidos)
 
 ---
 
-## Stack tecnológico
+## El problema
 
-| Capa | Tecnología | Por qué |
+Cuando un diseñador arma una plantilla PSD copiando y pegando capas entre *artboards*, Photoshop deja el archivo en un estado que **se ve bien al ojo humano pero está roto para la API de scripting**. Al automatizar el reemplazo de texto/imagen, el resultado sale descuadrado, en el lugar equivocado, o afecta capas que no debía.
+
+Estos daños son **invisibles en Photoshop** (la capa se ve perfecta) y solo aparecen cuando un proceso automático intenta manipular el archivo. Esta herramienta los encuentra **antes** de que lleguen a producción, y repara los que se pueden reparar sin intervención manual.
+
+---
+
+## Qué detecta (3 auditorías)
+
+Las tres se pueden activar/desactivar con los filtros de la barra superior. Todas vienen **activadas por defecto**.
+
+### 1. Text layers desincronizados (transform interno ≠ posición visual)
+
+Al copiar/pegar una capa de texto entre artboards, Photoshop actualiza el **bounds visual** (dónde se ve) pero deja el **transform interno** (`tx`, `ty`) apuntando al artboard **original**. La API de Photoshop reemplaza el texto en las coordenadas del transform → el texto sustituido cae en el lugar equivocado.
+
+> **Se repara automáticamente** con el botón *Corregir capas*.
+
+### 2. Smart objects compartidos (mismo asset embebido)
+
+Cuando se copia un smart object con `Ctrl+C` / `Ctrl+V`, Photoshop crea una capa nueva que **apunta al mismo asset interno** (mismo `unique_id`). Editar uno modifica todas las instancias → la API no puede reemplazar la imagen de uno sin afectar a los demás.
+
+> **Requiere acción manual**: en Photoshop, *Layer → Smart Objects → New Smart Object via Copy* en cada instancia.
+
+### 3. Nombres de capa duplicados (dentro de un mismo artboard)
+
+La automatización y el motor de reparación **buscan las capas por su nombre y usan la primera coincidencia**. Si dos capas comparten nombre dentro del mismo artboard, el nombre deja de identificar una capa única → se edita la capa equivocada.
+
+El ámbito es **por artboard**: que `headline` se repita entre artboards distintos (uno por plataforma) es legítimo y no se marca; solo es problema cuando se repite **dentro del mismo artboard**. Texto y smart objects comparten un mismo espacio de nombres (un texto `logo` y un smart object `logo` en el mismo artboard cuentan como duplicado).
+
+> **Requiere acción manual**: renombrar cada capa para que su nombre sea único dentro del artboard.
+
+---
+
+## Cómo funciona por dentro
+
+La herramienta tiene dos capas que se comunican por un archivo JSON temporal:
+
+- **Detección** → Python puro (`psd-tools`). No necesita Photoshop.
+- **Reparación** → Node.js puro (`ag-psd`). No necesita Photoshop.
+
+El PSD reparado siempre se escribe **al lado del original** como `<nombre>_fixed.psd`. **El original nunca se modifica.**
+
+```mermaid
+flowchart TD
+    A[PSD de entrada] --> B[detector.py<br/>análisis con psd-tools]
+    B --> C{¿Problemas?}
+    C -->|Text desincronizado| D[GUI: botón Corregir capas]
+    C -->|Smart object compartido| E[Acción manual en Photoshop]
+    C -->|Nombre duplicado| F[Renombrar en Photoshop]
+    D --> G[fixer.py<br/>arma manifest JSON]
+    G --> H[Node + ag-psd<br/>test11_boxbounds.js]
+    H --> I[nombre_fixed.psd<br/>al lado del original]
+```
+
+**Por qué este stack:**
+
+- **`psd-tools`** (Python) es la librería madura que entiende el descriptor `TyShO` de capas de texto y el `EngineData` (modelo binario de texto de Adobe). Lee sin escribir, ideal para auditar en paralelo.
+- **`ag-psd`** (Node) es la única librería JS que respeta la estructura de los descriptores al **escribir** PSD. Trae un parche imprescindible (`agpsd/patch_ag_psd.js`) que preserva CMYK, el perfil ICC y los `transformPoints` que ag-psd descartaría por defecto.
+- **Tkinter** para la interfaz: multiplataforma, sin dependencias extra, con `ProcessPoolExecutor` para analizar lotes grandes sin chocar con el GIL.
+
+---
+
+## Cómo decide cada cosa (la lógica de detección)
+
+Toda la detección vive en `detector.py` y corre sin Photoshop.
+
+### Text layers desincronizados — `check_type_layer`
+
+Compara dos coordenadas de la **misma** capa:
+
+- **Bounds visual** (`layer.left`, `layer.top`): dónde se dibuja la capa. Es la posición **correcta**.
+- **Transform interno** (`tx`, `ty` de `layer.transform`): dónde la **API de Photoshop planta el texto** al reemplazarlo. Es lo que puede estar **roto**.
+
+```
+delta_x = |tx - left|      delta_y = |ty - top|
+```
+
+Se marca como problema con **dos reglas independientes**:
+
+| Regla | Condición | Por qué |
 |---|---|---|
-| **Detección** | Python 3.10+ con [`psd-tools`](https://github.com/psd-tools/psd-tools) | `psd-tools` parsea PSD/PSB sin tener Photoshop instalado. Lee el descriptor `TyShO`, el `EngineData` (motor de texto de Adobe) y los `image_resources`. Permite analizar lotes grandes en paralelo. |
-| **Reparación** | Node.js 18+ con [`ag-psd`](https://www.npmjs.com/package/ag-psd) | `ag-psd` lee y **escribe** PSD respetando los descriptores. No necesita Photoshop. Reemplazó al fixer original basado en `fixer.jsx` (que sí requería Photoshop instalado + COM/AppleScript). |
-| **Interfaz** | Tkinter (stdlib de Python) | Multiplataforma, sin dependencias extra. Soporta `ProcessPoolExecutor` para analizar varios PSDs en paralelo sin chocar con el GIL. |
-| **Empaquetado** | PyInstaller | Genera `.exe` (Windows) y `.app` (macOS) para los diseñadores. *Nota:* el .exe actual no empaqueta el motor Node de reparación; ver sección "Limitaciones". |
+| **1. Delta + fuera del padre** | `delta > 200px` **Y** el transform cae fuera del artboard padre por más de `250px` | El texto centrado/derecha tiene deltas grandes legítimos; por eso las dos condiciones deben cumplirse a la vez. |
+| **2. Fuera del canvas** | El transform cae fuera del documento por más de `100px` | Pesca coordenadas internas ya inválidas (negativas o más allá del canvas), sin importar el delta. |
 
-### Por qué cada librería
+```
+es_problema = (delta_grande Y fuera_del_padre) O fuera_del_canvas
+```
 
-- **`psd-tools`** es la única librería madura en Python que entiende el formato `TyShO` de capas de texto, incluyendo el `EngineData` (un blob binario con el modelo de texto del motor de Adobe — fuentes, estilos, `ShapeType`, `boxBounds`). Lectura pura, no escribe.
-- **`ag-psd`** es la única librería JS que respeta la estructura interna de los descriptores al escribir. Su round-trip preserva la mayoría de los campos. Tiene patches custom en `agpsd/patch_ag_psd.js` para suplir lo que no preserva por defecto (ver Hallazgos).
-- **`canvas`** (peer dep de ag-psd) — necesaria solo porque ag-psd usa Canvas para decodificar imágenes incluso si pasas `useImageData: false`.
+**Casos especiales:**
+- **Texto vertical** (`Ornt='Vrtc'`): usa solo el eje X — `ty` puede caer fuera del canvas de forma legítima porque Photoshop guarda ahí la línea base.
+- **Texto *point*** (vs *paragraph*): se ignora por defecto. La API lo reposiciona bien aunque el delta sea enorme (`visual = tx + xx·boundingBox.left`, la escala absorbe el offset). Solo el texto *paragraph* rompe la API.
+- **Fuente**: se lee de los bytes crudos del PSD (`FontSet`), no del descriptor en vivo, porque Photoshop sustituye la fuente en runtime cuando el transform está corrupto y devolvería un nombre engañoso.
+
+### Smart objects compartidos — `analyze_smart_objects`
+
+Agrupa los smart objects por su `unique_id` (UUID del asset embebido). Cualquier grupo con **2 o más** capas apuntando al mismo UUID es un problema: son instancias enlazadas del mismo asset.
+
+### Nombres duplicados — `analyze_duplicate_names`
+
+1. Junta todas las capas de texto + smart objects.
+2. Calcula el **ámbito** de cada capa con `_nearest_artboard` (sube por `.parent` hasta topar con un `Artboard`; si no hay artboard → nivel documento).
+3. Agrupa por `(ámbito, nombre)`.
+4. Cualquier grupo con **2 o más** capas = nombre duplicado.
+
+Por eso el mismo nombre en artboards distintos **no** se marca, pero repetido dentro de un artboard **sí**.
 
 ---
 
-## Hallazgos clave (lo que aprendimos en el camino)
+## El manifest y la reparación
 
-Estos son los puntos no obvios. Todos están codificados en los algoritmos pero conviene tenerlos explícitos.
+El *manifest* es la instrucción que la capa Python le pasa al motor Node: **"la capa llamada X debe quedar en esta caja visual"**.
 
-### 1. Photoshop posiciona point text y paragraph text con fórmulas distintas
+Se arma en dos pasos:
 
-Al reemplazar el contenido de una capa de texto con la Photoshop API, Photoshop **no usa `tx, ty` directamente**. Usa una de dos fórmulas según el tipo:
+1. **La GUI** (`gui.py`, `_handle_fix_click`) toma solo las capas marcadas como problema y copia su **bounds visual** (la posición correcta).
+2. **`fixer.py`** (`_build_manifest`) lo reduce al formato mínimo y lo escribe en `psd_layers_to_fix.json` (carpeta temporal):
 
-| Tipo (`ShapeType`) | Fórmula efectiva | Anchor crítico |
-|---|---|---|
-| **Point** (`ShapeType=0`) | `visual.x = tx + xx · boundingBox.left` | `boundingBox` + escala |
-| **Paragraph** (`ShapeType=1`) | `visual.x = tx + 2 · boxBounds[0]` | `boxBounds` (en EngineData) |
-
-Consecuencia práctica:
-
-- **Solo paragraph text rompe la API** cuando se copia/pega. El `boxBounds` queda con coordenadas del artboard origen y como típicamente `xx = 1` (sin escala), no hay nada que absorba el error → el texto se planta fuera del canvas.
-- **Point text NO rompe la API**, aunque el detector vea un `delta` enorme entre `tx` y `bounds.left`. Eso pasa cuando el diseñador hizo Free Transform escalando la capa (ej. `xx = 3.77×`): Photoshop almacenó un `tx` muy negativo y un `boundingBox.left` muy grande, y al multiplicar por la escala da exactamente la posición visual correcta.
-
-Por eso la GUI tiene un checkbox **"Ignorar capas point"** activado por defecto: filtra falsos positivos de capas point con delta grande pero que renderizan bien. Si lo destildas, ves todos los casos (útil para auditar hábitos del equipo aunque no impacten la pipeline).
-
-### 2. La reparación para paragraph text requiere resetear `boxBounds`
-
-`boxBounds` es un campo **no documentado** que vive dentro del `EngineData`. ag-psd lo expone como `text.boxBounds = [L, T, R, B]`. La reparación de `agpsd/test11_boxbounds.js`:
-
-```
-bounds      → (0, 0, W, H)            // reseteo a coordenadas locales
-boundingBox → relativo a (0, 0) con offset original preservado
-boxBounds   → [0, 0, Wbox, Hbox]      // ¡crítico! sin esto el texto sigue saltando
-transform   → (xx, xy, yx, yy, target.left, target.top)
+```json
+[{ "name": "TEXT_VIGENCIA_01_Story", "left": 199, "top": 939, "right": 812, "bottom": 1010 }]
 ```
 
-Resetear `bounds` y `boundingBox` por sí solo NO arregla el problema. **El campo que decide la posición final es `boxBounds`** — si no lo reseteas, Photoshop sigue usando los `boxBounds` corruptos al re-renderizar y el texto vuelve a saltar.
+El manifest **no lleva estilos ni transform**: solo el **nombre** (para encontrar la capa) y la **caja visual destino** (la fuente de verdad). El motor Node (`test11_boxbounds.js`) busca la capa por nombre y **reescribe su transform interno** para que apunte a esa caja.
 
-### 3. ag-psd descarta image resources críticos al escribir
+> Aquí se ve por qué los **nombres duplicados** rompen todo: el manifest identifica la capa por nombre, y `findLayerByName` devuelve la **primera** coincidencia. Si el nombre no es único, se repara la capa equivocada.
 
-ag-psd tiene handlers internos para `ICC_PROFILE` (1039), `EXIF_DATA_1` (1058), `COLOR_HALFTONING_INFO` (1013), `COLOR_TRANSFER_FUNCTION` (1016) y `IPTC_NAA` (1028), pero **están gated bajo `MOCK_HANDLERS = false`** y nunca se registran. Resultado: el round-trip elimina el perfil ICC embebido.
+**Contrato de archivos** (todos en la carpeta temporal del sistema, salvo la salida):
 
-Sin perfil ICC, Photoshop al abrir el PSD reparado asume "documento sin perfil" y aplica el working space del usuario. **Los colores se ven distintos** (típicamente más opacos o desaturados). El primer fixed que generamos se veía visiblemente mal hasta que descubrimos esto.
-
-**Fix en `agpsd/patch_ag_psd.js`**: registramos manualmente handlers byte-passthrough para esos resources. El round-trip ahora preserva los colores exactos del original.
-
-### 4. El detector necesita reglas distintas para texto vertical
-
-Photoshop almacena la línea base del texto vertical en `ty`, así que `ty` puede legítimamente caer fuera del canvas en capas sanas. La regla de "transform fuera del canvas" se evalúa solo en el eje X cuando la capa tiene `Ornt = b'Vrtc'` en su TyShO.
-
-Texto horizontal rotado 90° **no** es texto vertical real — `Ornt` sigue siendo `b'Hrzn'` y el bbox queda alto y delgado. El detector infiere rotación cuando `height / width > 5` con `Ornt='Hrzn'`.
-
-### 5. La fuente real vive en `engine_dict.FontSet`, no en el descriptor en vivo
-
-Photoshop sustituye fuentes en tiempo de ejecución cuando el transform de una capa está corrupto. `textItem.font` o `fontPostScriptName` del descriptor en vivo devuelve la fuente sustituta (típicamente Myriad Pro), **no la original** del PSD. La fuente verdadera hay que leerla de los bytes crudos: `engine_dict.StyleRun.RunArray[0].StyleSheet.StyleSheetData.Font` indexado contra `layer.resource_dict.FontSet`.
-
-### 6. El inner `transform.tx/ty` NO está en coordenadas de canvas
-
-(Este hallazgo es del antiguo flujo basado en `fixer.jsx`, conservado por contexto.) Al setear `tx/ty` a un target en pixeles del canvas vía ScriptingListener / ActionDescriptor, Photoshop rechaza con "result too large". El truco era setear `tx/ty = 0` (identity), dejar que `setd` rerendere y luego ajustar la posición vía `move` en pasos pequeños.
-
-ag-psd opera al nivel del descriptor binario directamente y no tiene esta limitación.
-
----
-
-## Arquitectura
-
-```
-+---------------------------+         +-----------------------------+
-|  GUI (Tkinter, gui.py)    |         |  CLI (app.py)               |
-|  ProcessPoolExecutor      |         |                             |
-+------------+--------------+         +--------------+--------------+
-             |                                       |
-             v                                       v
-        +----+---------------------------------------+----+
-        |  detector.py  (psd-tools, sin Photoshop)       |
-        |  analyze_psd() -> problems[], smart_objects[]  |
-        +----+-------------------------------------------+
-             |
-             v   (al hacer click en "Corregir capas")
-        +----+----------------------------------------+
-        |  fixer.py  (subprocess hacia Node)          |
-        |  - arma manifest JSON                       |
-        |  - corre: node agpsd/test11_boxbounds.js    |
-        +----+----------------------------------------+
-             |
-             v
-        +----+----------------------------------------+
-        |  agpsd/test11_boxbounds.js  (Node + ag-psd) |
-        |  - reset bounds/boundingBox/boxBounds       |
-        |  - transform -> (xx, xy, yx, yy, target)    |
-        |  - escribe <basename>_fixed.psd             |
-        +---------------------------------------------+
-```
-
-El archivo de entrada nunca se modifica: la reparación produce siempre `<basename>_fixed.psd` al lado del original.
+| Archivo | Lo produce | Lo consume | Contenido |
+|---|---|---|---|
+| `psd_layers_to_fix.json` | `fixer.py` | `test11_boxbounds.js` | `[{name, left, top, right, bottom}]` |
+| `psd_fix_log.txt` | `fixer.py` | dev (al fallar) | stdout+stderr del proceso Node + exit code |
+| `<nombre>_fixed.psd` | `test11_boxbounds.js` | usuario final | El PSD reparado, al lado del original |
 
 ---
 
 ## Instalación
 
-### Windows
+Requiere **Python 3.9+** y (solo para reparar) **Node.js 18+**.
 
 ```powershell
-# 1. Python 3.10+ con "Add Python to PATH"
-# 2. Node.js 18+ (https://nodejs.org)
-pip install -r requirements.txt
-cd agpsd && npm install
+# Dependencias de detección + interfaz
+pip install psd-tools pillow
+
+# Dependencias del motor de reparación (Node)
+cd agpsd
+npm install
+cd ..
 ```
 
-### macOS
+> `pillow` lo usa la GUI para renderizar el icono, la ilustración de los
+> estados vacíos y los botones con degradado.
 
-```bash
-brew install python-tk node
-pip3 install -r requirements.txt
-cd agpsd && npm install
-```
+---
 
-### Uso
+## Uso
+
+### Interfaz gráfica (recomendado)
 
 ```powershell
-python gui.py                          # GUI completa (análisis + reparación)
-python app.py archivo.psd              # CLI: solo detección, sin reparar
-python app.py --include-groups arch.psd  # incluir también capas dentro de carpetas
+python gui.py
 ```
 
-### Build standalone
+1. **+ Agregar PSDs** — carga uno o varios archivos (soporta lotes grandes; procesa en paralelo, uno por core de CPU).
+2. **Analizar Todo** — corre las auditorías activas.
+3. Selecciona un archivo para ver el desglose completo en el panel de detalles.
+4. **Corregir capas** — repara los text layers desincronizados (genera `<nombre>_fixed.psd`). Requiere Node.js.
+
+**Filtros** (barra superior, todos activados por defecto):
+- **Ignorar carpetas** — no analiza capas dentro de *Groups* regulares (los Artboards siempre se recorren). Útil porque los grupos suelen tener assets compartidos (logos, legales) que no se automatizan.
+- **Ignorar capas point** — no marca texto *point* (la API lo posiciona bien aunque el delta sea grande). Desactívalo para auditar hábitos del equipo.
+- **Nombres duplicados** — activa la auditoría de nombres repetidos por artboard.
+
+### Línea de comandos (solo detección)
+
+```powershell
+python app.py ruta\al\archivo.psd
+python app.py --include-groups ruta\al\archivo.psd   # también entra a los Groups regulares
+```
+
+### Reparar sin la GUI
+
+```powershell
+cd agpsd
+node test11_boxbounds.js <entrada.psd absoluta> <manifest.json> <salida.psd absoluta>
+```
+
+> Los paths deben ser **absolutos**: el script de Node corre con `cwd` en `agpsd/`.
+
+---
+
+## Compilar el ejecutable
+
+Genera un ejecutable de escritorio (no requiere Python instalado en la máquina destino):
 
 ```powershell
 pip install -r requirements-build.txt
 python build.py
-# salida: dist/DetectorTextoPSD.{exe,app}
+```
+
+Salida (Windows): `dist/DetectorTextoPSD/DetectorTextoPSD.exe` (formato `--onedir`).
+
+El build incluye los assets (icono), el motor `agpsd/` y `fixer.jsx`, así que **tanto la detección como la reparación funcionan empaquetadas** (la reparación sigue necesitando Node.js instalado en la máquina destino).
+
+Para regenerar el icono: `python assets/make_icon.py`.
+
+---
+
+## Estructura del proyecto
+
+```
+Layer-Audit-PSD/
+├── gui.py               # Interfaz Tkinter (tema oscuro morado). Entrypoint principal.
+├── app.py               # CLI de solo detección.
+├── detector.py          # Toda la lógica de análisis (psd-tools). El corazón del proyecto.
+├── fixer.py             # Arma el manifest y lanza el motor Node.
+├── utils.py             # reveal_in_file_manager, check_node_available.
+├── build.py             # Empaquetado con PyInstaller.
+├── assets/
+│   ├── make_icon.py     # Generador del icono (Pillow).
+│   ├── icon.ico/.png    # Icono de la app / ventana / ejecutable.
+│   └── logo_header.png  # Logo del header de la GUI.
+└── agpsd/
+    ├── test11_boxbounds.js  # Motor de reparación activo (ag-psd).
+    ├── patch_ag_psd.js      # Parche imprescindible de ag-psd (CMYK, ICC, transforms).
+    └── node_modules/        # (npm install)
 ```
 
 ---
 
-## Uso de la GUI
+## Requisitos
 
-1. **Agregar archivos** con `+ Agregar PSDs` (botón superior).
-2. **Analizar** con `Analizar Todo` o el icono `▶` por fila.
-   - 🟢 **OK**: archivo limpio.
-   - 🔴 **Problemas**: hay capas de texto con transform corrupto o Smart Objects compartidos.
-3. **Toggles de filtrado**:
-   - `Ignorar carpetas` — no analiza capas dentro de Groups normales (sí dentro de Artboards). Útil porque los Groups suelen contener assets fijos (logos, legales) que no se modifican via automatización.
-   - `Ignorar capas point` — no marca como problema las capas point text aunque tengan delta grande. Es el default porque la Photoshop API las renderiza bien (ver Hallazgo #1). Destíldalo si quieres auditar hábitos del equipo aunque no impacten producción.
-4. **Corregir** un PSD con problemas → genera `<nombre>_fixed.psd` al lado del original. El original nunca se toca.
-5. **Ver archivo reparado** → abre el explorador con el nuevo archivo seleccionado.
+| Componente | Versión | Para qué |
+|---|---|---|
+| Python | 3.9+ | Detección (GUI y CLI) |
+| `psd-tools` | ≥ 1.9.0 | Parseo de PSD |
+| Node.js | 18+ | Reparación (botón *Corregir capas*) |
+| `ag-psd` | (en `agpsd/`) | Reescritura del PSD |
 
 ---
 
-## Limitaciones conocidas
+## Notas y límites conocidos
 
-- **El `.exe` empaquetado por `build.py` no incluye Node.js ni `agpsd/`.** La detección funcionará pero el botón "Corregir capas" mostrará "Node.js no detectado" salvo que el usuario tenga Node instalado y `agpsd/` esté junto al ejecutable. Si se requiere distribución autocontenida, hay que decidir entre (a) bundlear un Node portable + `agpsd/`, o (b) reescribir la reparación en Python (pendiente — `ag-psd` no tiene equivalente Python con escritura igual de fiel).
-- **`test11_boxbounds.js` está validado para texto horizontal point y paragraph.** Texto vertical y rotado pasa por el mismo algoritmo pero su corrección no está exhaustivamente validada — tratarlo como territorio de iteración.
-- **Smart Objects compartidos se detectan pero no se reparan automáticamente.** La GUI los lista; la corrección requiere intervención manual en Photoshop (Layer → Smart Objects → New Smart Object via Copy en cada instancia).
-- **`fixer.jsx`** (~1500 líneas) sigue en el repo por referencia histórica del flujo viejo basado en Photoshop. No se invoca desde la GUI actual.
-
----
-
-## Documentación de desarrollo
-
-Para detalles internos (algoritmos exactos de `check_type_layer`, contrato Python ↔ Node, gotchas al editar), ver [`CLAUDE.md`](./CLAUDE.md).
+- El original **nunca** se modifica; la reparación siempre escribe una copia `_fixed`.
+- Los thresholds de detección (`200px` delta, `250px` fuera del padre, `100px` fuera del canvas) están calibrados contra fixtures reales con texto centrado/justificado. Bajarlos genera falsos positivos.
+- La reparación está validada para **texto point y paragraph horizontal**. Los caminos de texto vertical y rotado pasan por el mismo motor pero su corrección aún no está verificada.
+- Los smart objects compartidos y los nombres duplicados **no** se reparan automáticamente (requieren decisiones humanas): la herramienta los detecta y explica cómo resolverlos.
+- Todos los textos de la interfaz están en español.
