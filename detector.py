@@ -231,6 +231,93 @@ def _layer_bounds(layer):
         return (0, 0, 0, 0)
 
 
+def _clean_font_name(raw):
+    """Limpia el PostScript name que devuelve psd_tools.
+
+    El formato TyShO crudo trae el nombre entre comillas simples literales
+    ("'Montserrat-Bold'"); las quitamos para dejar un PostScript name válido.
+    """
+    if raw is None:
+        return None
+    clean = str(raw).strip()
+    if len(clean) >= 2 and clean[0] == "'" and clean[-1] == "'":
+        clean = clean[1:-1]
+    return clean or None
+
+
+def _collect_layer_fonts(layer):
+    """Devuelve el conjunto de PostScript names usados en una capa de texto.
+
+    A diferencia de _extract_type_style (que solo mira el primer run), aquí
+    recorremos TODOS los StyleRun de la capa, porque una misma capa puede
+    mezclar varias fuentes (p. ej. una palabra en bold dentro de un párrafo).
+    Cada índice Font se resuelve contra el FontSet del resource_dict.
+    """
+    fonts = set()
+    try:
+        ed = layer.engine_dict
+        run_array = ed['StyleRun']['RunArray']
+        rd = layer.resource_dict
+        font_set = rd.get('FontSet', []) if hasattr(rd, 'get') else []
+        for run in run_array:
+            try:
+                data = run['StyleSheet']['StyleSheetData']
+                idx = data.get('Font')
+                if idx is None:
+                    continue
+                idx = int(idx)
+                if 0 <= idx < len(font_set):
+                    name = _clean_font_name(font_set[idx].get('Name'))
+                    if name:
+                        fonts.add(name)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return fonts
+
+
+def analyze_fonts(type_layers):
+    """Inventario de fuentes (PostScript names) usadas por las capas de texto.
+
+    Evita tener que abrir el PSD y revisar capa por capa: junta todas las
+    fuentes reales del documento leyendo los bytes del PSD (no el descriptor
+    en vivo, que Photoshop puede sustituir).
+
+    Retorna dict:
+        {
+            'total_fonts': int,                       # fuentes únicas
+            'fonts': [{'name': str, 'layer_count': int}, ...],   # alfabético
+            'by_artboard': [{'artboard': str, 'fonts': [str, ...]}, ...],
+        }
+    """
+    font_layer_count = defaultdict(int)
+    by_ab = defaultdict(set)
+    for layer in type_layers:
+        fonts = _collect_layer_fonts(layer)
+        if not fonts:
+            continue
+        _, ab_name = _nearest_artboard(layer)
+        ab_disp = ab_name or '(documento)'
+        for f in fonts:
+            font_layer_count[f] += 1
+            by_ab[ab_disp].add(f)
+
+    fonts_list = [
+        {'name': n, 'layer_count': c}
+        for n, c in sorted(font_layer_count.items(), key=lambda kv: kv[0].lower())
+    ]
+    by_artboard = [
+        {'artboard': ab, 'fonts': sorted(fs, key=str.lower)}
+        for ab, fs in sorted(by_ab.items(), key=lambda kv: kv[0].lower())
+    ]
+    return {
+        'total_fonts': len(font_layer_count),
+        'fonts': fonts_list,
+        'by_artboard': by_artboard,
+    }
+
+
 def analyze_duplicate_names(type_layers, smart_object_layers):
     """Detecta capas (texto y/o smart object) con nombres repetidos dentro
     de un MISMO artboard.
@@ -592,6 +679,7 @@ def analyze_psd(psd_path, threshold_px=THRESHOLD_PX,
             'shared_smart_objects': [],
             'smart_object_total': 0,
             'duplicate_name_groups': [],
+            'fonts_report': {'total_fonts': 0, 'fonts': [], 'by_artboard': []},
             'error': f"No se pudo abrir el PSD: {e}",
         }
 
@@ -640,6 +728,14 @@ def analyze_psd(psd_path, threshold_px=THRESHOLD_PX,
         if check_duplicate_names else []
     )
 
+    # Inventario de fuentes: recorremos TODO el árbol (skip_groups=False) para
+    # que el listado sea completo aunque el filtro "Ignorar carpetas" esté
+    # activo — el usuario quiere todas las fuentes del documento.
+    all_type_layers = []
+    for layer in psd:
+        collect_type_layers(layer, all_type_layers, skip_groups=False)
+    fonts_report = analyze_fonts(all_type_layers)
+
     templates_by_parent = {}
     fallback_template = None
     for r in layers_results:
@@ -680,5 +776,6 @@ def analyze_psd(psd_path, threshold_px=THRESHOLD_PX,
         'shared_smart_objects': shared,
         'smart_object_total': len(smart_object_layers),
         'duplicate_name_groups': dup_name_groups,
+        'fonts_report': fonts_report,
         'error': None,
     }

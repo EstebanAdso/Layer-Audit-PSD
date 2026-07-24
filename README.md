@@ -56,6 +56,16 @@ El ámbito es **por artboard**: que `headline` se repita entre artboards distint
 
 > **Requiere acción manual**: renombrar cada capa para que su nombre sea único dentro del artboard.
 
+### Extra: inventario de fuentes
+
+Además de las auditorías, el botón **Fuentes** (en el panel de detalles) abre el inventario completo de **todas las fuentes** que usa el PSD, por su **PostScript name** (`Montserrat-Bold`, `ArialMT`, `HelveticaLTPro-Roman`…), con:
+
+- El **total** de fuentes únicas y cuántas capas usa cada una.
+- El **desglose por artboard** (qué fuentes aparecen en cada uno).
+- Un botón **Copiar lista** para llevarte los nombres al portapapeles.
+
+Así no hay que abrir el PSD y revisar capa por capa. Los nombres se leen de los bytes del PSD (el `FontSet`), recorriendo **todos los StyleRun** de cada capa (una misma capa puede mezclar varias fuentes), así que refleja la fuente real aunque Photoshop la sustituya en runtime.
+
 ---
 
 ## Cómo funciona por dentro
@@ -190,7 +200,8 @@ python gui.py
 1. **+ Agregar PSDs** — carga uno o varios archivos (soporta lotes grandes; procesa en paralelo, uno por core de CPU).
 2. **Analizar Todo** — corre las auditorías activas.
 3. Selecciona un archivo para ver el desglose completo en el panel de detalles.
-4. **Corregir capas** — repara los text layers desincronizados (genera `<nombre>_fixed.psd`). Requiere Node.js.
+4. **Fuentes** — abre el inventario de todas las fuentes (PostScript name) del PSD, con total, desglose por artboard y opción de copiar la lista.
+5. **Corregir capas** — repara los text layers desincronizados (genera `<nombre>_fixed.psd`). Requiere Node.js.
 
 **Filtros** (barra superior, todos activados por defecto):
 - **Ignorar carpetas** — no analiza capas dentro de *Groups* regulares (los Artboards siempre se recorren). Útil porque los grupos suelen tener assets compartidos (logos, legales) que no se automatizan.

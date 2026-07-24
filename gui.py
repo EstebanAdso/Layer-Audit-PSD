@@ -38,7 +38,7 @@ from fixer import fix_layers_in_psd
 from utils import reveal_in_file_manager, check_node_available
 
 APP_TITLE = "Layer Audit PSD"
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.1.0"
 
 
 def _asset_path(name):
@@ -48,6 +48,27 @@ def _asset_path(name):
     else:
         base = os.path.dirname(os.path.abspath(__file__))
     return os.path.join(base, 'assets', name)
+
+
+def _apply_dark_titlebar(window):
+    """Pinta la barra de título de una ventana Windows en oscuro (DWM).
+
+    Silencioso en plataformas/versiones sin soporte. Se usa tanto en la
+    ventana principal como en los popups (Toplevel)."""
+    if platform.system() != 'Windows':
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+        window.update_idletasks()
+        hwnd = ctypes.windll.user32.GetParent(window.winfo_id())
+        value = ctypes.c_int(1)
+        for attr in (20, 19):  # DWMWA_USE_IMMERSIVE_DARK_MODE (Win11 / Win10)
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                wintypes.HWND(hwnd), ctypes.c_int(attr),
+                ctypes.byref(value), ctypes.sizeof(value))
+    except Exception:
+        pass
 
 # Paleta oscura "morado casi negro" (tema v2). clam permite colores custom
 # en Win/Mac/Linux. La estructura la da la tipografia y el espaciado; el
@@ -74,6 +95,11 @@ HOVER_BG    = "#221936"   # fondo de fila en hover
 SCROLL_THUMB     = "#3f3560"
 SCROLL_THUMB_HOV = "#4c3a7a"
 SCROLL_THUMB_ACT = "#5b4a8a"
+
+# Botones secundarios: un tono elevado que contrasta tanto sobre SURFACE
+# como sobre SURFACE_ALT, para que se lean como botones (no como texto).
+BTN_BG  = "#2b2348"
+BTN_HOV = "#372c5c"
 
 # Degradado de los botones primarios (violeta → púrpura).
 GRAD_1 = (124, 92, 255)   # #7c5cff
@@ -704,6 +730,11 @@ class DetailsPanel(tk.Frame):
             command=self._handle_reveal_click
         )
 
+        self.fonts_action_btn = ttk.Button(
+            title_row, text="Fuentes",
+            command=self._show_fonts_popup
+        )
+
         self.fix_action_btn = GradientButton(
             title_row, "Corregir capas",
             self._handle_fix_click, bg=SURFACE)
@@ -733,12 +764,18 @@ class DetailsPanel(tk.Frame):
         self._body = tk.Frame(self, bg=SURFACE)
         self._body.pack(fill='both', expand=True, padx=SPACE_XS, pady=SPACE_XS)
 
+        # Fila de chips de estadística (Documento, Text layers, ...): solo en
+        # resultados. Reemplaza la vieja línea de resumen en monospace.
+        self.stats_bar = tk.Frame(self._body, bg=SURFACE)
+
+        # Contenedor de texto + scrollbar (se oculta en modo hero).
+        self._text_wrap = tk.Frame(self._body, bg=SURFACE)
         self.text = tk.Text(
-            self._body, wrap='word', bg=SURFACE, fg=TEXT, bd=0,
+            self._text_wrap, wrap='word', bg=SURFACE, fg=TEXT, bd=0,
             highlightthickness=0, padx=SPACE_LG + 2, pady=SPACE_MD,
-            font=FONT_MONO, spacing1=2, spacing3=2, cursor='arrow'
+            font=FONT_BODY, spacing1=2, spacing3=2, cursor='arrow'
         )
-        self._sb = ttk.Scrollbar(self._body, command=self.text.yview)
+        self._sb = ttk.Scrollbar(self._text_wrap, command=self.text.yview)
         self.text.configure(yscrollcommand=self._sb.set)
         self.text.pack(side='left', fill='both', expand=True)
         self._sb.pack(side='right', fill='y')
@@ -851,33 +888,143 @@ class DetailsPanel(tk.Frame):
     def _update_action_bar(self, row):
         if row is None:
             self.reveal_action_btn.pack_forget()
+            self.fonts_action_btn.pack_forget()
             self.fix_action_btn.pack_forget()
             return
 
-        # Boton Mostrar en carpeta siempre
+        # Orden con side='right': lo primero empacado queda más a la derecha.
+        # Resultado visual izq→der: [Corregir capas] [Fuentes] [Mostrar…]
         self.reveal_action_btn.config(text="Mostrar en carpeta")
         self.reveal_action_btn.pack(side='right')
+
+        # Boton Fuentes: siempre que el análisis haya encontrado fuentes.
+        has_fonts = False
+        if row.result and not row.result.get('error'):
+            fr = row.result.get('fonts_report') or {}
+            has_fonts = fr.get('total_fonts', 0) > 0
+        if has_fonts:
+            self.fonts_action_btn.pack(side='right', padx=(0, SPACE_SM))
+        else:
+            self.fonts_action_btn.pack_forget()
 
         # Boton Corregir solo si hay problemas de texto
         show_fix = False
         is_fixed_file = "_fixed.psd" in row.filepath.lower() or "_fixed.psb" in row.filepath.lower()
-        
+
         if row.result and not row.result.get('error'):
             if row.result.get('problems'):
                 show_fix = True
-        
+
         if row.state == ST_FIXED:
             self.fix_action_btn.pack_forget()
             self.reveal_action_btn.config(text="Ver archivo reparado")
         elif is_fixed_file:
-            # Si ya es un archivo reparado, no mostramos botón de corregir, 
+            # Si ya es un archivo reparado, no mostramos botón de corregir,
             # pero el de revelar carpeta sigue ahí.
             self.fix_action_btn.pack_forget()
             self.reveal_action_btn.config(text="Ver archivo reparado")
         elif show_fix:
-            self.fix_action_btn.pack(side='right', padx=(0, 6))
+            self.fix_action_btn.pack(side='right', padx=(0, SPACE_SM))
         else:
             self.fix_action_btn.pack_forget()
+
+    def _show_fonts_popup(self):
+        """Popup con el inventario de fuentes (PostScript names) del PSD:
+        el total de fuentes únicas + desglose por artboard, para no tener
+        que abrir el PSD y revisar capa por capa."""
+        if not self.current_row or not self.current_row.result:
+            return
+        fr = self.current_row.result.get('fonts_report') or {}
+        fonts = fr.get('fonts', [])
+        if not fonts:
+            return
+        filename = self.current_row.filename
+
+        existing = getattr(self, '_fonts_popup', None)
+        if existing is not None and existing.winfo_exists():
+            existing.destroy()
+
+        top = self.winfo_toplevel()
+        popup = tk.Toplevel(top)
+        self._fonts_popup = popup
+        popup.title(f"Fuentes — {filename}")
+        popup.configure(bg=SURFACE)
+        popup.minsize(440, 420)
+        popup.transient(top)
+        # Centrar sobre la ventana principal.
+        try:
+            top.update_idletasks()
+            w, h = 540, 640
+            x = top.winfo_rootx() + (top.winfo_width() - w) // 2
+            y = top.winfo_rooty() + (top.winfo_height() - h) // 2
+            popup.geometry(f"{w}x{h}+{max(0, x)}+{max(0, y)}")
+        except tk.TclError:
+            popup.geometry("540x640")
+        _apply_dark_titlebar(popup)
+
+        header = tk.Frame(popup, bg=SURFACE)
+        header.pack(fill='x', padx=SPACE_XL, pady=(SPACE_LG, SPACE_SM))
+        tk.Label(header, text="Fuentes del documento", bg=SURFACE, fg=TEXT,
+                 font=FONT_TITLE, anchor='w').pack(anchor='w')
+        tk.Label(header,
+                 text=f"{filename}   ·   {fr.get('total_fonts', 0)} "
+                      f"fuente(s) única(s)",
+                 bg=SURFACE, fg=TEXT_MUTED, font=FONT_CAPTION,
+                 anchor='w').pack(anchor='w', pady=(2, 0))
+
+        tk.Frame(popup, bg=BORDER, height=1).pack(fill='x')
+
+        body = tk.Frame(popup, bg=SURFACE)
+        body.pack(fill='both', expand=True, padx=SPACE_XS, pady=SPACE_XS)
+        txt = tk.Text(body, wrap='word', bg=SURFACE, fg=TEXT, bd=0,
+                      highlightthickness=0, padx=SPACE_LG, pady=SPACE_MD,
+                      font=FONT_MONO, cursor='arrow', spacing1=1, spacing3=1)
+        sb = ttk.Scrollbar(body, command=txt.yview)
+        txt.configure(yscrollcommand=sb.set)
+        txt.pack(side='left', fill='both', expand=True)
+        sb.pack(side='right', fill='y')
+
+        txt.tag_configure('h', font=('Segoe UI', 10, 'bold'), foreground=TEXT,
+                          spacing1=12, spacing3=6)
+        txt.tag_configure('font', font=('Segoe UI', 10, 'bold'),
+                          foreground=TEXT, spacing1=3)
+        txt.tag_configure('muted', font=FONT_CAPTION, foreground=TEXT_MUTED)
+        txt.tag_configure('ab', font=('Segoe UI', 9, 'bold'),
+                          foreground=PRIMARY_HOV, spacing1=10, spacing3=2)
+
+        txt.insert('end', "  TODAS LAS FUENTES\n", 'h')
+        for x in fonts:
+            n = x['layer_count']
+            txt.insert('end', f"  •  {x['name']}", 'font')
+            txt.insert('end', f"    en {n} capa{'s' if n != 1 else ''}\n",
+                       'muted')
+
+        by_ab = fr.get('by_artboard', [])
+        if by_ab:
+            txt.insert('end', "\n  POR ARTBOARD\n", 'h')
+            for ab in by_ab:
+                txt.insert('end', f"\n  {ab['artboard']}\n", 'ab')
+                for name in ab['fonts']:
+                    txt.insert('end', f"      –  {name}\n", 'muted')
+        txt.config(state='disabled')
+
+        footer = tk.Frame(popup, bg=SURFACE_ALT)
+        footer.pack(fill='x')
+
+        def _copy():
+            names = "\n".join(x['name'] for x in fonts)
+            popup.clipboard_clear()
+            popup.clipboard_append(names)
+            copy_btn.config(text="¡Copiado!")
+            popup.after(1300, lambda: copy_btn.winfo_exists()
+                        and copy_btn.config(text="Copiar lista"))
+
+        copy_btn = ttk.Button(footer, text="Copiar lista", command=_copy)
+        copy_btn.pack(side='left', padx=SPACE_LG, pady=SPACE_SM)
+        ttk.Button(footer, text="Cerrar",
+                   command=popup.destroy).pack(side='right', padx=SPACE_LG,
+                                               pady=SPACE_SM)
+        popup.bind('<Escape>', lambda e: popup.destroy())
 
     def _show_reveal_btn(self, show):
         if show:
@@ -892,18 +1039,18 @@ class DetailsPanel(tk.Frame):
         Determinista (no depende de winfo_ismapped, que es falso durante la
         construcción): pack_forget es no-op si no está empacado.
         """
-        self.text.pack_forget()
-        self._sb.pack_forget()
+        self.stats_bar.pack_forget()
+        self._text_wrap.pack_forget()
         self.hero_frame.pack(fill='both', expand=True)
 
     def _exit_hero_mode(self):
-        """Oculta el overlay hero y restaura el Text widget."""
+        """Oculta el overlay hero y restaura los chips + el Text widget."""
         self.hero_frame.pack_forget()
-        self.text.pack(side='left', fill='both', expand=True)
-        self._sb.pack(side='right', fill='y')
+        self.stats_bar.pack(side='top', fill='x',
+                            padx=SPACE_LG, pady=(SPACE_MD, 0))
+        self._text_wrap.pack(side='top', fill='both', expand=True)
 
-    def _render_hero(self, title, caption, image='hero.png',
-                     bullets=None, dim_image=False):
+    def _render_hero(self, title, caption, image='hero.png', bullets=None):
         """Dibuja un estado centrado con ilustración + título + caption
         (+ checklist opcional) en el overlay hero."""
         for w in self.hero_frame.winfo_children():
@@ -1013,10 +1160,46 @@ class DetailsPanel(tk.Frame):
 
         self._update_action_bar(row)
 
+        self._render_stats(result)
         self.text.config(state='normal')
         self.text.delete('1.0', 'end')
         self._render(result)
         self.text.config(state='disabled')
+
+    def _chip(self, label, value, accent=TEXT):
+        """Un tile de estadística: etiqueta pequeña arriba, valor grande abajo."""
+        c = tk.Frame(self.stats_bar, bg=SURFACE_ALT)
+        c.pack(side='left', padx=(0, SPACE_SM))
+        tk.Label(c, text=label.upper(), bg=SURFACE_ALT, fg=TEXT_MUTED,
+                 font=('Segoe UI', 8), anchor='w').pack(
+                     anchor='w', padx=SPACE_MD, pady=(SPACE_SM, 0))
+        tk.Label(c, text=value, bg=SURFACE_ALT, fg=accent,
+                 font=('Segoe UI', 12, 'bold'), anchor='w').pack(
+                     anchor='w', padx=SPACE_MD, pady=(0, SPACE_SM))
+
+    def _render_stats(self, result):
+        """Fila de chips con las cifras clave del documento."""
+        for w in self.stats_bar.winfo_children():
+            w.destroy()
+        if result.get('error'):
+            return
+
+        text_p = len(result.get('problems', []))
+        shared_so = len(result.get('shared_smart_objects', []))
+        dup = len(result.get('duplicate_name_groups', []))
+        total_layers = result.get('total', 0)
+        total_so = result.get('smart_object_total', 0)
+        fonts = (result.get('fonts_report') or {}).get('total_fonts', 0)
+
+        self._chip("Documento", f"{result['width']} × {result['height']}")
+        self._chip("Text layers",
+                   f"{total_layers}" + (f"  ·  {text_p}⚠" if text_p else ""),
+                   ERR if text_p else TEXT)
+        self._chip("Smart objects",
+                   f"{total_so}" + (f"  ·  {shared_so}⚠" if shared_so else ""),
+                   ERR if shared_so else TEXT)
+        self._chip("Nombres dup.", f"{dup}", ERR if dup else TEXT)
+        self._chip("Fuentes", f"{fonts}", PRIMARY_HOV if fonts else TEXT)
 
     def _render(self, result):
         if self.current_row.state == ST_FIXED:
@@ -1036,13 +1219,7 @@ class DetailsPanel(tk.Frame):
         shared_so = result.get('shared_smart_objects', [])
         dup_groups = result.get('duplicate_name_groups', [])
 
-        self.text.insert('end',
-            f"\n  Documento: {result['width']}x{result['height']}px"
-            f"   |   Text layers: {result['total']} ({len(text_p)} con problemas)"
-            f"   |   Smart objects: {result.get('smart_object_total', 0)} "
-            f"({len(shared_so)} compartidos)"
-            f"   |   Nombres duplicados: {len(dup_groups)}\n",
-            'muted')
+        # (El resumen del documento ahora vive en los chips de self.stats_bar.)
 
         # ---- Text layers desincronizados ---------------------------------
         if text_p:
@@ -1258,26 +1435,8 @@ class App(tk.Tk):
             pass
 
     def _enable_dark_titlebar(self):
-        """Pinta la barra de titulo de Windows en oscuro (DWM immersive dark
-        mode). Silencioso en plataformas o versiones que no lo soportan —
-        el resto de la UI ya es oscura, esto solo completa el look."""
-        if platform.system() != 'Windows':
-            return
-        try:
-            import ctypes
-            from ctypes import wintypes
-            self.update_idletasks()
-            hwnd = ctypes.windll.user32.GetParent(self.winfo_id())
-            value = ctypes.c_int(1)
-            # 20 = DWMWA_USE_IMMERSIVE_DARK_MODE (Win10 2004+/Win11);
-            # 19 en builds mas viejos. Intentamos ambos.
-            for attr in (20, 19):
-                ctypes.windll.dwmapi.DwmSetWindowAttribute(
-                    wintypes.HWND(hwnd), ctypes.c_int(attr),
-                    ctypes.byref(value), ctypes.sizeof(value)
-                )
-        except Exception:
-            pass
+        """Barra de título oscura para la ventana principal (ver módulo)."""
+        _apply_dark_titlebar(self)
 
     def _setup_style(self):
         style = ttk.Style(self)
@@ -1286,18 +1445,21 @@ class App(tk.Tk):
         except tk.TclError:
             pass
 
+        # Botones secundarios: fondo elevado + borde para que se lean como
+        # botones (antes eran texto plano invisible sobre el panel oscuro).
         style.configure('TButton',
-                        background=SURFACE, foreground=TEXT,
+                        background=BTN_BG, foreground=TEXT,
                         borderwidth=1, focusthickness=0,
                         padding=(14, 8), relief='flat',
                         font=('Segoe UI', 9))
         style.map('TButton',
-                  background=[('active', HOVER_BG), ('pressed', BORDER),
-                              ('disabled', SURFACE_ALT)],
-                  foreground=[('disabled', TEXT_MUTED)],
-                  bordercolor=[('!disabled', BORDER)],
-                  lightcolor=[('!disabled', BORDER)],
-                  darkcolor=[('!disabled', BORDER)])
+                  background=[('active', BTN_HOV), ('pressed', BTN_HOV),
+                              ('disabled', SURFACE)],
+                  foreground=[('disabled', TEXT_MUTED),
+                              ('active', PRIMARY_HOV)],
+                  bordercolor=[('active', PRIMARY_DIM), ('!disabled', BORDER)],
+                  lightcolor=[('active', PRIMARY_DIM), ('!disabled', BORDER)],
+                  darkcolor=[('active', PRIMARY_DIM), ('!disabled', BORDER)])
 
         style.configure('Primary.TButton',
                         background=PRIMARY, foreground='#ffffff',
