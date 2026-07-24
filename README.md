@@ -199,7 +199,7 @@ python gui.py
 
 1. **+ Agregar PSDs** — carga uno o varios archivos (soporta lotes grandes; procesa en paralelo, uno por core de CPU).
 2. **Analizar Todo** — corre las auditorías activas.
-3. Selecciona un archivo para ver el desglose completo en el panel de detalles.
+3. Selecciona un archivo para ver el desglose completo en el panel de detalles. En **Todos los text layers**, cada capa tiene una flecha ▸ que despliega su **contenido** (lo que dice el texto), sin abrir el PSD.
 4. **Fuentes** — abre el inventario de todas las fuentes (PostScript name) del PSD, con total, desglose por artboard y opción de copiar la lista.
 5. **Corregir capas** — repara los text layers desincronizados (genera `<nombre>_fixed.psd`). Requiere Node.js.
 

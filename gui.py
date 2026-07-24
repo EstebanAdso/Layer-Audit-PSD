@@ -714,6 +714,11 @@ class DetailsPanel(tk.Frame):
         self._on_fix = on_fix
         self.current_row = None
 
+        # Estado de despliegue del contenido por capa (flechas ▸/▾).
+        self._expand_state = {}
+        self._arrow_widgets = []
+        self._layer_uid = 0
+
         self.header = tk.Frame(self, bg=SURFACE)
         self.header.pack(fill='x', padx=SPACE_XL, pady=(SPACE_LG + 4, SPACE_MD))
 
@@ -798,6 +803,11 @@ class DetailsPanel(tk.Frame):
         self.text.tag_configure('mono', font=FONT_MONO, foreground=TEXT)
         self.text.tag_configure('mono_muted', font=FONT_MONO,
                                 foreground=TEXT_MUTED)
+        # Contenido de la capa (lo que "dice") — cita indentada.
+        self.text.tag_configure('content', foreground=TEXT,
+                                font=('Segoe UI', 10, 'italic'),
+                                lmargin1=54, lmargin2=54, rmargin=24,
+                                spacing1=2, spacing3=6)
         # Tags para empty / pending / running states con jerarquia visual.
         self.text.tag_configure('hero_glyph',
                                 font=('Segoe UI', 36),
@@ -1202,6 +1212,12 @@ class DetailsPanel(tk.Frame):
         self._chip("Fuentes", f"{fonts}", PRIMARY_HOV if fonts else TEXT)
 
     def _render(self, result):
+        # Reset del estado de despliegue (las flechas viejas se destruyen al
+        # borrar el contenido del Text en show_result).
+        self._expand_state = {}
+        self._arrow_widgets = []
+        self._layer_uid = 0
+
         if self.current_row.state == ST_FIXED:
             self.text.insert('end', "\n  ARCHIVO REPARADO CON EXITO\n", 'h')
             self.text.insert('end', 
@@ -1359,8 +1375,22 @@ class DetailsPanel(tk.Frame):
         else:
             sym, tag = '!', 'warn'
 
-        self.text.insert('end', f"\n  {sym}  ", tag)
-        self.text.insert('end', f"{r['name']}\n", tag)
+        content = (r.get('text') or '').strip()
+        has_content = bool(content)
+
+        # Símbolo + nombre, y un chip "ver texto ▾" que despliega el contenido.
+        self.text.insert('end', f"\n  {sym}  {r['name']}   ", tag)
+        if has_content:
+            uid = self._layer_uid
+            self._layer_uid += 1
+            chip = tk.Label(self.text, text="  ver texto  ▾  ",
+                            bg=BTN_BG, fg=PRIMARY_HOV,
+                            font=('Segoe UI', 8, 'bold'), cursor='hand2',
+                            bd=0, padx=SPACE_XS, pady=1,
+                            highlightthickness=1, highlightbackground=PRIMARY_DIM)
+            self.text.window_create('end', window=chip)
+            self._arrow_widgets.append(chip)
+        self.text.insert('end', "\n", tag)
 
         if r['transform']:
             bl, bt = r['bounds']
@@ -1372,6 +1402,24 @@ class DetailsPanel(tk.Frame):
                 'mono_muted')
         elif r['error']:
             self.text.insert('end', f"      error: {r['error']}\n", 'mono_muted')
+
+        # Contenido de la capa, oculto (elide) hasta pulsar el chip.
+        if has_content:
+            shown = content if len(content) <= 600 else content[:600] + '…'
+            tagn = f'celide_{uid}'
+            self.text.tag_configure(tagn, elide=True)
+            self.text.insert('end', f"      “{shown}”\n", ('content', tagn))
+            chip.bind('<Button-1>',
+                      lambda e, u=uid, c=chip, t=tagn: self._toggle_content(u, c, t))
+            chip.bind('<Enter>', lambda e, c=chip: c.config(bg=BTN_HOV))
+            chip.bind('<Leave>', lambda e, c=chip: c.config(bg=BTN_BG))
+
+    def _toggle_content(self, uid, chip, tagn):
+        expanded = not self._expand_state.get(uid, False)
+        self._expand_state[uid] = expanded
+        self.text.tag_configure(tagn, elide=not expanded)
+        chip.config(text="  ocultar  ▴  " if expanded else "  ver texto  ▾  ")
+        return 'break'
 
 
 # ===========================================================================

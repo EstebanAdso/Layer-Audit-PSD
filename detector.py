@@ -456,6 +456,12 @@ def check_type_layer(layer, threshold_px=THRESHOLD_PX,
     bounds_top = layer.top
     bounds_right = layer.right
     bounds_bottom = layer.bottom
+    # Contenido de texto de la capa (lo que "dice"). Se muestra en la GUI
+    # de forma desplegable para no tener que abrir el PSD.
+    try:
+        text_content = layer.text
+    except Exception:
+        text_content = None
     layer_id = _safe_attr(layer, 'layer_id')
     parent = _safe_attr(layer, 'parent')
     parent_id = _safe_attr(parent, 'layer_id')
@@ -575,6 +581,7 @@ def check_type_layer(layer, threshold_px=THRESHOLD_PX,
 
         return {
             'name': layer.name,
+            'text': text_content,
             'layer_id': layer_id,
             'parent_id': parent_id,
             'parent_name': parent_name,
@@ -599,6 +606,7 @@ def check_type_layer(layer, threshold_px=THRESHOLD_PX,
     except Exception as e:
         return {
             'name': layer.name,
+            'text': text_content,
             'layer_id': layer_id,
             'parent_id': parent_id,
             'parent_name': parent_name,
